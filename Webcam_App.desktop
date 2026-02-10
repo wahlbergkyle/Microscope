@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Webcam App
+Comment=USB Webcam Application with Timelapse Support
+Exec=/home/kyle/U\ of\ M/Microscope/launch_webcam_app.sh
+Icon=/home/kyle/U\ of\ M/Microscope/webcam_app.png
+Terminal=false
+StartupNotify=true
+Categories=AudioVideo;Photography;Graphics;
+Keywords=webcam;camera;photo;timelapse;capture;video;
+MimeType=image/jpeg;image/png;
+StartupWMClass=Webcam_App

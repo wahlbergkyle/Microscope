@@ -1,0 +1,201 @@
+name: Build Cross-Platform Executables
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # Allow manual triggering
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.9']  # Use stable Python version
+        
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+        
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+          
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+        
+    - name: Create application icons
+      run: python create_icon.py
+      
+    - name: Build Linux executable
+      if: runner.os == 'Linux'
+      run: |
+        pyinstaller --clean Webcam_App.spec
+        chmod +x dist/Webcam_App
+        
+    - name: Build Windows executable  
+      if: runner.os == 'Windows'
+      run: |
+        pyinstaller --clean Webcam_App_Windows.spec
+        
+    - name: Build macOS executable
+      if: runner.os == 'macOS'
+      run: |
+        pyinstaller --clean Webcam_App_macOS.spec
+        
+    - name: Test executable (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        # Test that the executable exists and is executable
+        test -x dist/Webcam_App
+        echo "Linux executable built successfully"
+        
+    - name: Test executable (Windows)
+      if: runner.os == 'Windows'
+      run: |
+        # Test that the executable exists
+        if (Test-Path "dist/Webcam_App.exe") {
+          Write-Host "Windows executable built successfully"
+        } else {
+          Write-Error "Windows executable not found"
+          exit 1
+        }
+      shell: powershell
+      
+    - name: Test executable (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        # Test that the app bundle exists
+        test -d dist/Webcam_App.app
+        echo "macOS app bundle built successfully"
+        
+    - name: Create release artifacts
+      shell: bash
+      run: |
+        # Create platform-specific archives
+        cd dist
+        if [[ "$RUNNER_OS" == "Linux" ]]; then
+          tar -czf ../Webcam_App_Linux.tar.gz Webcam_App
+          echo "ARTIFACT_NAME=Webcam_App_Linux.tar.gz" >> $GITHUB_ENV
+        elif [[ "$RUNNER_OS" == "Windows" ]]; then
+          7z a ../Webcam_App_Windows.zip Webcam_App.exe
+          echo "ARTIFACT_NAME=Webcam_App_Windows.zip" >> $GITHUB_ENV
+        elif [[ "$RUNNER_OS" == "macOS" ]]; then
+          tar -czf ../Webcam_App_macOS.tar.gz Webcam_App.app
+          echo "ARTIFACT_NAME=Webcam_App_macOS.tar.gz" >> $GITHUB_ENV
+        fi
+        
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: webcam-app-${{ runner.os }}
+        path: |
+          Webcam_App_Linux.tar.gz
+          Webcam_App_Windows.zip
+          Webcam_App_macOS.tar.gz
+        retention-days: 30
+        if-no-files-found: ignore
+        
+    - name: Get file size
+      shell: bash
+      run: |
+        if [[ "$RUNNER_OS" == "Linux" ]]; then
+          SIZE=$(du -sh dist/Webcam_App | cut -f1)
+          echo "Linux executable size: $SIZE"
+        elif [[ "$RUNNER_OS" == "Windows" ]]; then
+          SIZE=$(du -sh dist/Webcam_App.exe | cut -f1)
+          echo "Windows executable size: $SIZE"
+        elif [[ "$RUNNER_OS" == "macOS" ]]; then
+          SIZE=$(du -sh dist/Webcam_App.app | cut -f1)
+          echo "macOS app bundle size: $SIZE"
+        fi
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+      
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Webcam App ${{ github.ref }}
+        body: |
+          ## Webcam App Release ${{ github.ref }}
+          
+          Cross-platform USB webcam application with timelapse support.
+          
+          ### Downloads:
+          - **Windows**: Download `Webcam_App_Windows.zip`
+          - **macOS**: Download `Webcam_App_macOS.tar.gz` 
+          - **Linux**: Download `Webcam_App_Linux.tar.gz`
+          
+          ### Features:
+          - Real-time webcam preview
+          - Photo capture with custom names
+          - Video recording
+          - Timelapse photography with consistent settings
+          - Manual exposure and gain controls
+          - Multiple camera support
+          
+          ### Installation:
+          See [DESKTOP_INSTALLATION.md](DESKTOP_INSTALLATION.md) for detailed instructions.
+          
+        draft: false
+        prerelease: false
+        
+    - name: Upload Linux Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./webcam-app-Linux/Webcam_App_Linux.tar.gz
+        asset_name: Webcam_App_Linux.tar.gz
+        asset_content_type: application/gzip
+        
+    - name: Upload Windows Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./webcam-app-Windows/Webcam_App_Windows.zip
+        asset_name: Webcam_App_Windows.zip
+        asset_content_type: application/zip
+        
+    - name: Upload macOS Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./webcam-app-macOS/Webcam_App_macOS.tar.gz
+        asset_name: Webcam_App_macOS.tar.gz
+        asset_content_type: application/gzip
