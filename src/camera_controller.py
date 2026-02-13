@@ -13,6 +13,37 @@ import os
 import sys
 import glob
 from typing import Optional, Tuple, List
+import warnings
+import contextlib
+
+# Suppress Python warnings
+warnings.filterwarnings('ignore')
+
+# Suppress OpenCV error messages on Windows (especially obsensor errors)
+if sys.platform.startswith('win'):
+    os.environ['OPENCV_LOG_LEVEL'] = 'FATAL'  # Only show fatal errors
+    os.environ['OPENCV_VIDEOIO_PRIORITY_MSMF'] = '0'  # Deprioritize MSMF
+    os.environ['OPENCV_VIDEOIO_PRIORITY_DSHOW'] = '100'  # Prioritize DirectShow
+
+
+# Helper context manager to suppress stderr on Windows
+@contextlib.contextmanager
+def suppress_opencv_warnings():
+    """Suppress OpenCV warnings by redirecting stderr."""
+    if sys.platform.startswith('win'):
+        import msvcrt
+        stderr_fileno = sys.stderr.fileno()
+        old_stderr = os.dup(stderr_fileno)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, stderr_fileno)
+            yield
+        finally:
+            os.dup2(old_stderr, stderr_fileno)
+            os.close(devnull)
+            os.close(old_stderr)
+    else:
+        yield
 
 
 class CameraController:
@@ -62,7 +93,7 @@ class CameraController:
     
     def _try_initialize_with_backends(self, camera_indices):
         """
-        Try initializing camera with different backends to fix Linux USB issues.
+        Try initializing camera with different backends based on platform.
         
         Args:
             camera_indices: List of camera indices to try
@@ -70,13 +101,31 @@ class CameraController:
         Returns:
             bool: True if successful
         """
-        # Different backends to try for Linux USB webcam compatibility
-        backends_to_try = [
-            cv2.CAP_V4L2,    # Video4Linux2 - most common on Linux
-            cv2.CAP_V4L,     # Video4Linux - fallback
-            cv2.CAP_ANY,     # Auto-detect backend
-            cv2.CAP_GSTREAMER  # GStreamer - alternative
-        ]
+        # Platform-specific backends to try
+        if sys.platform.startswith('win'):
+            # Windows: Try DirectShow first, then MSMF as fallback
+            backends_to_try = [
+                cv2.CAP_DSHOW,   # DirectShow - most reliable for most cameras
+                cv2.CAP_MSMF,    # Windows Media Foundation - works for some cameras
+                cv2.CAP_ANY,     # Auto-detect backend (fallback)
+            ]
+        elif sys.platform.startswith('linux'):
+            # Linux: Use V4L2/V4L
+            backends_to_try = [
+                cv2.CAP_V4L2,    # Video4Linux2 - most common on Linux
+                cv2.CAP_V4L,     # Video4Linux - fallback
+                cv2.CAP_ANY,     # Auto-detect backend
+                cv2.CAP_GSTREAMER  # GStreamer - alternative
+            ]
+        elif sys.platform.startswith('darwin'):
+            # macOS: Use AVFoundation
+            backends_to_try = [
+                cv2.CAP_AVFOUNDATION,  # AVFoundation - macOS native
+                cv2.CAP_ANY,           # Auto-detect backend
+            ]
+        else:
+            # Unknown platform: just try auto-detect
+            backends_to_try = [cv2.CAP_ANY]
         
         for camera_index in camera_indices:
             for backend in backends_to_try:
@@ -88,22 +137,27 @@ class CameraController:
                     if not self.cap.isOpened():
                         continue
                     
-                    # Apply Linux USB webcam fixes before testing
-                    success = self._apply_usb_webcam_fixes()
-                    if not success:
-                        self.cap.release()
-                        continue
+                    # Apply platform-specific webcam fixes before testing
+                    if sys.platform.startswith('linux'):
+                        success = self._apply_usb_webcam_fixes()
+                        if not success:
+                            self.cap.release()
+                            continue
                     
                     # Test frame capture with multiple attempts
+                    # DirectShow on Windows may produce black frames initially - give it more time
+                    max_test_attempts = 30 if (sys.platform.startswith('win') and backend == cv2.CAP_DSHOW) else 5
+                    warmup_delay = 0.2 if (sys.platform.startswith('win') and backend == cv2.CAP_DSHOW) else 0.1
+                    
                     frame_captured = False
-                    for attempt in range(5):  # Try multiple times
+                    for attempt in range(max_test_attempts):
                         ret, frame = self.cap.read()
                         if ret and frame is not None and frame.size > 0:
                             # Check if frame is not just black
                             if frame.mean() > 1.0:  # Not completely black
                                 frame_captured = True
                                 break
-                        time.sleep(0.1)  # Small delay between attempts
+                        time.sleep(warmup_delay)
                     
                     if frame_captured:
                         print(f"Successfully initialized camera {camera_index} with {self._get_backend_name(backend)}")
@@ -133,9 +187,12 @@ class CameraController:
         """Get human-readable backend name."""
         backend_names = {
             cv2.CAP_V4L2: "V4L2",
-            cv2.CAP_V4L: "V4L", 
+            cv2.CAP_V4L: "V4L",
             cv2.CAP_ANY: "AUTO",
-            cv2.CAP_GSTREAMER: "GStreamer"
+            cv2.CAP_GSTREAMER: "GStreamer",
+            cv2.CAP_DSHOW: "DirectShow",
+            cv2.CAP_MSMF: "MSMF",
+            cv2.CAP_AVFOUNDATION: "AVFoundation"
         }
         return backend_names.get(backend, f"Backend_{backend}")
     
@@ -161,8 +218,8 @@ class CameraController:
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             
-            # Fix 4: Set stable framerate
-            self.cap.set(cv2.CAP_PROP_FPS, 15)
+            # Fix 4: DON'T limit FPS - let camera run at native speed
+            # Setting low FPS here can throttle recording performance
             
             # Fix 5: Disable auto-exposure initially (can cause black frames)
             self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # Manual mode
@@ -208,33 +265,54 @@ class CameraController:
             np.ndarray: Captured frame as numpy array, or None if failed
         """
         if not self.cap or not self.cap.isOpened():
+            print("get_frame: Camera not opened")
             return None
         
         # Try multiple attempts to get a non-black frame
         max_attempts = 10
         for attempt in range(max_attempts):
-            ret, frame = self.cap.read()
-            if ret and frame is not None and frame.size > 0:
-                # Check if frame is not completely black
-                frame_mean = frame.mean()
-                if frame_mean > 1.0:  # Not a black frame
-                    return frame
-                elif attempt < max_attempts - 1:  # Not the last attempt
-                    # Skip this black frame and try again
+            try:
+                ret, frame = self.cap.read()
+                if not ret:
+                    if attempt == 0:
+                        print(f"get_frame: cap.read() returned False")
+                if ret and frame is not None and frame.size > 0:
+                    # Ensure frame is contiguous in memory (fixes Windows MSMF issues)
+                    # This MUST be done before any operations on the frame
+                    if not frame.flags['C_CONTIGUOUS']:
+                        frame = np.ascontiguousarray(frame)
+                    
+                    # Check if frame is not completely black
+                    frame_mean = frame.mean()
+                    if frame_mean > 1.0:  # Not a black frame
+                        return frame
+                    elif attempt < max_attempts - 1:  # Not the last attempt
+                        # Skip this black frame and try again
+                        time.sleep(0.05)
+                        continue
+                    else:
+                        # Last attempt - return even if black (better than None)
+                        print("Warning: Camera producing black frames")
+                        return frame
+            except (cv2.error, ValueError) as e:
+                # Handle OpenCV matrix errors on Windows (MSMF stride issues)
+                if attempt == 0:
+                    print(f"get_frame: Error on read - {type(e).__name__}: {e}")
+                if attempt < max_attempts - 1:
                     time.sleep(0.05)
                     continue
                 else:
-                    # Last attempt - return even if black (better than None)
-                    print("Warning: Camera producing black frames")
-                    return frame
-            elif attempt < max_attempts - 1:
+                    print(f"Camera frame error after {max_attempts} attempts: {e}")
+                    return None
+            
+            if attempt < max_attempts - 1:
                 time.sleep(0.05)
         
         return None
     
     # TODO Allow user to specify filename based on batch
     # TODO Allow user to specify exposure time and gain
-    def take_photo(self, filename: Optional[str] = None, output_dir: str = "photos") -> bool:
+    def take_photo(self, filename: Optional[str] = None, output_dir: str = "photos") -> tuple[bool, Optional[np.ndarray]]:
         """
         Capture and save a photo.
         
@@ -243,11 +321,11 @@ class CameraController:
             output_dir (str): Directory to save photos (default: "photos")
             
         Returns:
-            bool: True if photo saved successfully, False otherwise
+            tuple: (success: bool, frame: np.ndarray or None) - True/frame if photo saved successfully
         """
         frame = self.get_frame()
         if frame is None:
-            return False
+            return False, None
         
         # Create output directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
@@ -263,10 +341,10 @@ class CameraController:
         try:
             cv2.imwrite(filepath, frame)
             print(f"Photo saved: {filepath}")
-            return True
+            return True, frame
         except Exception as e:
             print(f"Error saving photo: {e}")
-            return False
+            return False, None
     
     def start_recording(self, filename: Optional[str] = None, output_dir: str = "videos") -> bool:
         """
@@ -290,44 +368,149 @@ class CameraController:
         if filename is None:
             # TODO if doing timestamp, reduce unnecessary variables
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"video_{timestamp}.mp4"
+            filename = f"video_{timestamp}.mp4"  # Use .mp4 for best compatibility
         
-        self.recording_filename = os.path.join(output_dir, filename)
+        # Ensure .mp4 extension
+        base_name = os.path.splitext(filename)[0]
+        
+        self.recording_filename = os.path.join(output_dir, base_name + ".mp4")
         
         # Get camera properties
-        fps = int(self.cap.get(cv2.CAP_PROP_FPS)) or 30
+        fps = int(self.cap.get(cv2.CAP_PROP_FPS))
+        if fps <= 0 or fps > 120:
+            fps = 30  # Default to 30 FPS if invalid
+            print(f"Invalid camera FPS detected, using {fps} FPS")
+        
+        # CRITICAL: Use lower FPS for VideoWriter to match actual capture rate
+        # Windows DirectShow often can't deliver frames as fast as reported
+        # Using a lower FPS prevents file corruption from frame timing mismatch
+        writer_fps = 10  # Conservative FPS that we can reliably achieve
+        print(f"Camera reports {fps} FPS, using {writer_fps} FPS for video file")
+        
         width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
-        # Initialize video writer
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        self.video_writer = cv2.VideoWriter(
-            self.recording_filename, fourcc, fps, (width, height)
-        )
+        # Ensure dimensions are even (required for many codecs)
+        width = width - (width % 2)
+        height = height - (height % 2)
         
-        if not self.video_writer.isOpened():
-            print("Error: Could not initialize video writer")
+        print(f"Recording settings: {width}x{height} @ {writer_fps} FPS")
+        
+        # Store dimensions for frame validation
+        self.recording_width = width
+        self.recording_height = height
+        
+        # Platform-specific codec selection
+        # On Windows, use FFmpeg backend codecs for better MP4 support
+        if sys.platform.startswith('win'):
+            codecs_to_try = [
+                ('MJPG', 'Motion JPEG'),       # Most reliable on Windows
+                ('mp4v', 'MPEG-4 (mp4v)'),     # Standard MP4
+                ('MP4V', 'MPEG-4 (MP4V)'),     # Uppercase variant
+            ]
+        else:
+            codecs_to_try = [
+                ('mp4v', 'MPEG-4'),
+                ('avc1', 'H264'),
+                ('X264', 'X264'),
+                ('XVID', 'XVID'),
+                ('MJPG', 'Motion JPEG'),
+            ]
+        
+        self.video_writer = None
+        for fourcc_code, codec_name in codecs_to_try:
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*fourcc_code)
+                # Create VideoWriter with the conservative FPS we can achieve
+                writer = cv2.VideoWriter(
+                    self.recording_filename, 
+                    fourcc,  # Don't force FFmpeg backend - let OpenCV choose
+                    writer_fps,  # Use realistic FPS
+                    (width, height),
+                    True  # isColor flag
+                )
+                # Test if it actually works
+                if writer.isOpened():
+                    self.video_writer = writer
+                    self.video_codec = fourcc_code  # Store for debugging
+                    print(f"Using {codec_name} codec for .mp4 recording")
+                    break
+                else:
+                    writer.release()
+            except Exception as e:
+                pass  # Try next codec
+        
+        if not self.video_writer or not self.video_writer.isOpened():
+            print("Error: Could not initialize video writer with any codec")
             return False
+        
+        # Optimize camera for maximum recording speed
+        try:
+            # Request maximum FPS from camera (don't throttle)
+            self.cap.set(cv2.CAP_PROP_FPS, 60)  # Request high FPS, camera will provide what it can
+            
+            # Disable buffering to get frames as fast as camera provides them
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception as e:
+            print(f"Note: Could not optimize all camera settings: {e}")
         
         self.is_recording = True
+        self.frame_count = 0  # Track frames written
+        self.recording_start_time = time.time()  # Track when recording started
         print(f"Recording started: {self.recording_filename}")
+        
+        # Print actual camera FPS setting
+        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        print(f"Camera FPS setting: {actual_fps}")
+        
         return True
     
-    def record_frame(self) -> bool:
+    def record_frame(self) -> tuple[bool, Optional[np.ndarray]]:
         """
         Record the current frame to video (call this continuously while recording).
+        Uses fast path optimized for video - bypasses get_frame() overhead.
         
         Returns:
-            bool: True if frame recorded successfully, False otherwise
+            tuple: (success: bool, frame: np.ndarray or None) - True/frame if recorded successfully
         """
         if not self.is_recording or not self.video_writer:
-            return False
+            return False, None
         
-        frame = self.get_frame()
-        if frame is not None:
-            self.video_writer.write(frame)
-            return True
-        return False
+        if not self.cap or not self.cap.isOpened():
+            return False, None
+        
+        try:
+            # Fast path: direct read without validation overhead
+            ret, frame = self.cap.read()
+            
+            if ret and frame is not None and frame.size > 0:
+                # Resize frame if needed to match recording dimensions
+                if hasattr(self, 'recording_width') and hasattr(self, 'recording_height'):
+                    if frame.shape[1] != self.recording_width or frame.shape[0] != self.recording_height:
+                        frame = cv2.resize(frame, (self.recording_width, self.recording_height))
+                
+                # Only essential processing: ensure memory contiguity for Windows
+                if not frame.flags['C_CONTIGUOUS']:
+                    frame = np.ascontiguousarray(frame)
+                
+                # Write immediately - no black frame detection, no retries
+                if self.is_recording and self.video_writer:
+                    try:
+                        self.video_writer.write(frame)
+                        if hasattr(self, 'frame_count'):
+                            self.frame_count += 1
+                        return True, frame
+                    except Exception as write_error:
+                        print(f"Error writing frame {self.frame_count}: {write_error}")
+                        return False, None
+                    
+        except (cv2.error, Exception) as e:
+            # Log but don't retry - keep going for video
+            if self.is_recording:
+                print(f"Error capturing frame: {e}")
+            return False, None
+            
+        return False, None
     
     def stop_recording(self) -> bool:
         """
@@ -341,10 +524,57 @@ class CameraController:
         
         self.is_recording = False
         
+        # Small delay to allow recording thread to finish current frame
+        import time
+        time.sleep(0.15)
+        
         if self.video_writer:
-            self.video_writer.release()
-            self.video_writer = None
-            print(f"Recording saved: {self.recording_filename}")
+            # Print stats before closing
+            frame_count = getattr(self, 'frame_count', 0)
+            recording_duration = time.time() - getattr(self, 'recording_start_time', time.time())
+            actual_fps = frame_count / recording_duration if recording_duration > 0 else 0
+            
+            print(f"Finalizing video: {frame_count} frames written over {recording_duration:.1f} seconds")
+            print(f"Actual capture rate: {actual_fps:.1f} FPS")
+            
+            # CRITICAL: Properly finalize the video file
+            try:
+                # Explicitly flush any buffered frames before release
+                # This is critical for MP4 file integrity
+                if hasattr(self.video_writer, 'release'):
+                    # Give VideoWriter time to finalize internal buffers
+                    time.sleep(0.1)
+                    
+                    # Release the writer - this writes MP4 header and index
+                    self.video_writer.release()
+                    
+                    # Additional delay to ensure file system writes complete
+                    time.sleep(0.2)
+                    
+                    print("Video writer released successfully")
+            except Exception as e:
+                print(f"Error releasing video writer: {e}")
+            finally:
+                self.video_writer = None
+            
+            # Verify the file was created and has size
+            if os.path.exists(self.recording_filename):
+                file_size = os.path.getsize(self.recording_filename)
+                print(f"Recording saved: {self.recording_filename} ({file_size} bytes, {frame_count} frames)")
+                
+                if file_size < 1000:  # Less than 1KB is suspicious
+                    print("Warning: Video file is very small, may be corrupted")
+                    print("This usually means the codec failed to initialize properly.")
+                elif frame_count == 0:
+                    print("Warning: No frames were written to the video file")
+                elif actual_fps < 20:
+                    print(f"Warning: Low capture rate ({actual_fps:.1f} FPS). Video may play faster than real-time.")
+                    print("Tip: Close other applications or reduce resolution for better performance.")
+                else:
+                    print("✓ Video file appears valid")
+            else:
+                print(f"Warning: Video file not found: {self.recording_filename}")
+            
             return True
         
         return False
@@ -426,7 +656,27 @@ class CameraController:
         if not self.cap or not self.cap.isOpened():
             return False
         
-        return self.cap.set(cv2.CAP_PROP_GAIN, gain_value)
+        # On Windows (DirectShow/MSMF) and some cameras, gain control requires manual exposure mode
+        # V4L2 cameras use mode 1 for manual exposure, DirectShow uses 0.25
+        auto_mode = self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+        if auto_mode != 1.0 and auto_mode != 0.25:
+            # Try V4L2 manual mode first
+            if not self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1):
+                # Fall back to OpenCV/DirectShow manual mode
+                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+        
+        # Now try to set the gain value
+        success = self.cap.set(cv2.CAP_PROP_GAIN, gain_value)
+        
+        # Verify the gain was actually set (some cameras silently fail)
+        if success:
+            actual_gain = self.cap.get(cv2.CAP_PROP_GAIN)
+            # Check if the value is reasonably close (within 10%)
+            if abs(actual_gain - gain_value) > gain_value * 0.1 and abs(actual_gain - gain_value) > 1.0:
+                print(f"Warning: Requested gain {gain_value}, but camera reports {actual_gain}")
+                # Still return True since the set operation succeeded
+        
+        return success
     
     def set_auto_exposure(self, auto: bool) -> bool:
         """
@@ -444,12 +694,28 @@ class CameraController:
         # V4L2 cameras: 3 = auto, 1 = manual
         # OpenCV default: 0.75 = auto, 0.25 = manual
         # Try V4L2 mode first, fall back to OpenCV mode
+        success = False
         if auto:
-            return self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3) or \
-                   self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+            success = self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)
+            if not success:
+                success = self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
         else:
-            return self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1) or \
-                   self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+            success = self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+            if not success:
+                success = self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+        
+        # On Windows, changing exposure mode can disrupt the stream
+        # Flush a few frames to allow camera to stabilize
+        if success and sys.platform.startswith('win'):
+            import time
+            time.sleep(0.05)  # Brief delay for camera to adjust
+            for _ in range(3):
+                try:
+                    self.cap.read()
+                except:
+                    pass
+        
+        return success
     
     def get_exposure_range(self) -> Tuple[float, float]:
         """
@@ -461,26 +727,46 @@ class CameraController:
         if not self.cap or not self.cap.isOpened():
             return (0.0, 0.0)
         
-        # Try to probe the actual exposure range
-        # First ensure manual mode
-        original_mode = self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
-        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # V4L2 manual
-        
-        # Get current exposure as a reference
-        current = self.cap.get(cv2.CAP_PROP_EXPOSURE)
-        
-        # Try to find min/max by testing values
-        self.cap.set(cv2.CAP_PROP_EXPOSURE, 1)
-        min_exp = self.cap.get(cv2.CAP_PROP_EXPOSURE)
-        
-        self.cap.set(cv2.CAP_PROP_EXPOSURE, 10000)
-        max_exp = self.cap.get(cv2.CAP_PROP_EXPOSURE)
-        
-        # Restore original exposure and mode
-        self.cap.set(cv2.CAP_PROP_EXPOSURE, current)
-        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, original_mode)
-        
-        return (min_exp, max_exp)
+        try:
+            # Save current state
+            original_mode = self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+            current = self.cap.get(cv2.CAP_PROP_EXPOSURE)
+            
+            # Set manual mode for accurate exposure control
+            # Try V4L2 manual mode first
+            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+            if self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE) != 1:
+                # Fall back to DirectShow manual mode
+                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+            
+            # Collect actual values the camera reports
+            test_values = [-13, -10, -7, -5, -3, 1, 10, 50, 100, 500, 1000, 5000, 10000]
+            actual_values = []
+            
+            for test_val in test_values:
+                self.cap.set(cv2.CAP_PROP_EXPOSURE, test_val)
+                actual = self.cap.get(cv2.CAP_PROP_EXPOSURE)
+                if actual not in actual_values:
+                    actual_values.append(actual)
+            
+            if actual_values:
+                min_exp = min(actual_values)
+                max_exp = max(actual_values)
+            else:
+                min_exp, max_exp = 10.0, 625.0  # Fallback
+            
+            # Restore original exposure and mode
+            self.cap.set(cv2.CAP_PROP_EXPOSURE, current)
+            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, original_mode)
+            
+            # Ensure we have a valid range (min < max)
+            if min_exp >= max_exp:
+                return (10.0, 625.0)  # Fallback to default
+            
+            return (min_exp, max_exp)
+        except:
+            # Fallback to a reasonable default for most webcams
+            return (10.0, 625.0)
     
     def get_gain_range(self) -> Tuple[float, float]:
         """
@@ -492,14 +778,43 @@ class CameraController:
         if not self.cap or not self.cap.isOpened():
             return (0.0, 0.0)
         
-        # Try to get gain range - this is camera dependent
-        # Most USB cameras support gain values between 0 and 100
         try:
+            # Save current state
+            original_mode = self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
             current_gain = self.cap.get(cv2.CAP_PROP_GAIN)
-            # Return a reasonable default range for USB cameras
-            return (0.0, 100.0)
+            
+            # Set manual mode for accurate gain control
+            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # V4L2 manual
+            if self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE) != 1:
+                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # DirectShow manual
+            
+            # Collect actual values the camera reports
+            test_values = [0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 255.0]
+            actual_values = []
+            
+            for test_val in test_values:
+                self.cap.set(cv2.CAP_PROP_GAIN, test_val)
+                actual = self.cap.get(cv2.CAP_PROP_GAIN)
+                if actual not in actual_values:
+                    actual_values.append(actual)
+            
+            if actual_values:
+                min_gain = min(actual_values)
+                max_gain = max(actual_values)
+            else:
+                min_gain, max_gain = 0.0, 100.0  # Fallback
+            
+            # Restore original state
+            self.cap.set(cv2.CAP_PROP_GAIN, current_gain)
+            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, original_mode)
+            
+            # Ensure we have a valid range (min < max)
+            if min_gain >= max_gain:
+                return (0.0, 100.0)  # Fallback to default
+            
+            return (min_gain, max_gain)
         except:
-            return (0.0, 0.0)
+            return (0.0, 100.0)  # Fallback to default range
     
     def capture_timelapse_series(self, num_photos: int, interval_seconds: float, 
                                output_dir: str = "timelapse", 
@@ -601,25 +916,45 @@ class CameraController:
 
         if sys.platform.startswith("linux"):
             device_indices = self._get_linux_device_indices()
+        elif sys.platform.startswith("win"):
+            # On Windows, check fewer indices since most systems have 1-2 cameras
+            device_indices = list(range(4))
         else:
-            device_indices = list(range(16))
+            # macOS and others
+            device_indices = list(range(8))
 
         # Check camera indices from detected device nodes (or fallback range)
         for i in device_indices:
             try:
-                if sys.platform.startswith("linux"):
-                    cap = cv2.VideoCapture(i, cv2.CAP_V4L2)
-                else:
-                    cap = cv2.VideoCapture(i)
+                # Suppress OpenCV errors for unavailable cameras
+                with suppress_opencv_warnings():
+                    if sys.platform.startswith("linux"):
+                        cap = cv2.VideoCapture(i, cv2.CAP_V4L2)
+                    elif sys.platform.startswith("win"):
+                        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+                    else:
+                        cap = cv2.VideoCapture(i)
+                        
                 if cap.isOpened():
                     # Actually test if we can read a frame
-                    ret, frame = cap.read()
-                    if ret and frame is not None:
-                        available_cameras.append(i)
-                        if verbose:
-                            print(f"Found working camera at index {i}")
-                    elif verbose:
-                        print(f"Camera at index {i} opened but cannot read frames")
+                    # DirectShow needs warm-up time on Windows
+                    try:
+                        if sys.platform.startswith("win"):
+                            # Give DirectShow time to warm up
+                            for _ in range(10):
+                                cap.read()
+                                time.sleep(0.1)
+                        
+                        ret, frame = cap.read()
+                        if ret and frame is not None and frame.size > 0:
+                            available_cameras.append(i)
+                            if verbose:
+                                print(f"Found working camera at index {i}")
+                        elif verbose:
+                            print(f"Camera at index {i} opened but cannot read frames")
+                    except cv2.error:
+                        # Suppress OpenCV errors
+                        pass
                     cap.release()
             except Exception as e:
                 # Silently continue if there's an error with this index
@@ -655,17 +990,35 @@ class CameraController:
                 cap = self.cap
                 temp_cap = False
             else:
-                cap = cv2.VideoCapture(camera_index)
+                # Suppress OpenCV backend errors (especially obsensor on Windows)
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    if sys.platform.startswith('win'):
+                        cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+                    else:
+                        cap = cv2.VideoCapture(camera_index)
                 temp_cap = True
             
             if cap.isOpened():
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    info['available'] = True
-                    info['width'] = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                    info['height'] = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    info['fps'] = cap.get(cv2.CAP_PROP_FPS)
-                    info['backend'] = cap.get(cv2.CAP_PROP_BACKEND)
+                # Try to read frame, but catch matrix assertion errors on Windows
+                try:
+                    # DirectShow needs warm-up time on Windows
+                    if temp_cap and sys.platform.startswith('win'):
+                        for _ in range(10):
+                            cap.read()
+                            time.sleep(0.1)
+                    
+                    ret, frame = cap.read()
+                    if ret and frame is not None and frame.size > 0:
+                        info['available'] = True
+                        info['width'] = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        info['height'] = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        info['fps'] = cap.get(cv2.CAP_PROP_FPS)
+                        info['backend'] = cap.get(cv2.CAP_PROP_BACKEND)
+                except cv2.error:
+                    # Suppress OpenCV matrix errors
+                    pass
             
             if temp_cap:
                 cap.release()

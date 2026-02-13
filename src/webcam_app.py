@@ -18,6 +18,7 @@ from tkinter import ttk, messagebox, filedialog
 import cv2
 import numpy as np
 import threading
+import sys
 
 from PIL import Image
 try:
@@ -54,6 +55,7 @@ class WebcamApp:
         self.camera_controller = None
         self.current_frame = None
         self.preview_running = False
+        self.pause_preview_for_recording = False  # Pause preview when recording
         self.recording_thread = None
         self.timelapse_thread = None
         self.timelapse_running = False
@@ -63,15 +65,21 @@ class WebcamApp:
         
         # Check ImageTk support for preview rendering
         self.image_tk_available, self.image_tk_error = self.check_imagetk_support()
+        print(f"ImageTk available: {self.image_tk_available}")
 
         # Create GUI elements
+        print("Setting up GUI...")
         self.setup_gui()
+        print("GUI setup complete")
         
         # Initialize camera
+        print("Initializing camera...")
         self.initialize_camera()
+        print("Camera initialization complete")
         
         # Force canvas update after window is ready
         self.root.after(100, self.force_canvas_update)
+        print("WebcamApp initialization complete")
         
     def load_application_config(self):
         """Load application configuration."""
@@ -225,38 +233,48 @@ class WebcamApp:
         self.exposure_scale = ttk.Scale(control_frame, from_=10.0, to=625.0, 
                                        variable=self.exposure_var, orient=tk.HORIZONTAL,
                                        command=self.on_exposure_changed)
-        self.exposure_scale.grid(row=15, column=1, columnspan=2, sticky=(tk.W, tk.E), pady=2)
+        self.exposure_scale.grid(row=15, column=1, sticky=(tk.W, tk.E), pady=2)
         
-        self.exposure_label = ttk.Label(control_frame, text="300.0")
-        self.exposure_label.grid(row=16, column=1, columnspan=2, sticky=tk.W)
+        # Exposure Entry Field
+        self.exposure_entry = ttk.Entry(control_frame, width=8)
+        self.exposure_entry.insert(0, "300.0")
+        self.exposure_entry.grid(row=15, column=2, sticky=tk.W, padx=(5, 0))
+        self.exposure_entry.bind('<Return>', self.on_exposure_entry)
+        self.exposure_entry.bind('<FocusOut>', self.on_exposure_entry)
+        self.exposure_entry.bind('<Tab>', lambda e: self.on_exposure_entry(e) or 'break')
         
         # Gain Control
-        ttk.Label(control_frame, text="Gain:").grid(row=17, column=0, sticky=tk.W)
+        ttk.Label(control_frame, text="Gain:").grid(row=16, column=0, sticky=tk.W)
         self.gain_var = tk.DoubleVar(value=0.0)
         self.gain_scale = ttk.Scale(control_frame, from_=0.0, to=100.0, 
                                    variable=self.gain_var, orient=tk.HORIZONTAL,
                                    command=self.on_gain_changed)
-        self.gain_scale.grid(row=17, column=1, columnspan=2, sticky=(tk.W, tk.E), pady=2)
+        self.gain_scale.grid(row=16, column=1, sticky=(tk.W, tk.E), pady=2)
         
-        self.gain_label = ttk.Label(control_frame, text="0.0")
-        self.gain_label.grid(row=18, column=1, columnspan=2, sticky=tk.W)
+        # Gain Entry Field
+        self.gain_entry = ttk.Entry(control_frame, width=8)
+        self.gain_entry.insert(0, "0.0")
+        self.gain_entry.grid(row=16, column=2, sticky=tk.W, padx=(5, 0))
+        self.gain_entry.bind('<Return>', self.on_gain_entry)
+        self.gain_entry.bind('<FocusOut>', self.on_gain_entry)
+        self.gain_entry.bind('<Tab>', lambda e: self.on_gain_entry(e) or 'break')
         
         # Separator
         ttk.Separator(control_frame, orient="horizontal").grid(
-            row=19, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
+            row=17, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
         
         # Directory Settings
         ttk.Label(control_frame, text="Directories", 
-                 font=("Arial", 10, "bold")).grid(row=20, column=0, columnspan=3, 
+                 font=("Arial", 10, "bold")).grid(row=18, column=0, columnspan=3, 
                                                  sticky=tk.W, pady=(0, 5))
         
         ttk.Button(control_frame, text="Photo Directory", 
-                  command=self.select_photo_directory).grid(row=21, column=0, 
+                  command=self.select_photo_directory).grid(row=19, column=0, 
                                                            columnspan=3, pady=2, 
                                                            sticky=(tk.W, tk.E))
         
         ttk.Button(control_frame, text="Video Directory", 
-                  command=self.select_video_directory).grid(row=22, column=0, 
+                  command=self.select_video_directory).grid(row=20, column=0, 
                                                            columnspan=3, pady=2, 
                                                            sticky=(tk.W, tk.E))
         
@@ -273,6 +291,9 @@ class WebcamApp:
         self.preview_canvas = tk.Canvas(preview_frame, width=640, height=480, 
                                        bg="black")
         self.preview_canvas.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Clicking canvas should unfocus entry fields
+        self.preview_canvas.bind('<Button-1>', lambda e: self.preview_canvas.focus_set())
         
         # Preview controls
         controls_frame = ttk.Frame(preview_frame)
@@ -388,7 +409,11 @@ class WebcamApp:
             else:
                 self.status_var.set(f"Camera {actual_index} initialized")
             
-            self.refresh_cameras()
+            # Don't refresh cameras immediately - it creates conflicts on Windows
+            # Just populate with current camera
+            self.camera_combo['values'] = [f"Camera {actual_index}"]
+            self.camera_combo.set(f"Camera {actual_index}")
+            
             self.initialize_camera_controls()
         else:
             self.status_var.set("No cameras found")
@@ -408,26 +433,56 @@ class WebcamApp:
         exposure_range = self.camera_controller.get_exposure_range()
         gain_range = self.camera_controller.get_gain_range()
         
+        # Store ranges for info panel
+        self.current_exposure_range = exposure_range
+        self.current_gain_range = gain_range
+        
+        # Track what ranges were detected
+        range_info = []
+        
         if exposure_range != (0.0, 0.0):
             self.exposure_scale.config(from_=exposure_range[0], to=exposure_range[1])
+            range_info.append(f"Exposure: {exposure_range[0]:.1f}-{exposure_range[1]:.1f}")
         
         if gain_range != (0.0, 0.0):
             self.gain_scale.config(from_=gain_range[0], to=gain_range[1])
+            range_info.append(f"Gain: {gain_range[0]:.1f}-{gain_range[1]:.1f}")
+        
+        # Display detected ranges in status
+        if range_info:
+            print(f"Camera ranges detected: {', '.join(range_info)}")
         
         # Set current values
         current_exposure = properties.get('exposure', -6.0)
         current_gain = properties.get('gain', 0.0)
         current_auto_exp = properties.get('auto_exposure', 0.75)
         
+        # Check if we're in auto exposure mode
+        auto_enabled = (current_auto_exp == 3.0 or current_auto_exp == 0.75)
+        
+        # If not in auto mode, clamp and set values to ensure camera is in correct state
+        if not auto_enabled:
+            # Clamp values to detected ranges
+            if exposure_range != (0.0, 0.0):
+                current_exposure = max(exposure_range[0], min(exposure_range[1], current_exposure))
+            if gain_range != (0.0, 0.0):
+                current_gain = max(gain_range[0], min(gain_range[1], current_gain))
+            
+            # Actually set the values to the camera to ensure correct state
+            self.camera_controller.set_exposure_time(current_exposure)
+            self.camera_controller.set_gain(current_gain)
+        
         # Update UI controls without triggering callbacks
         self.exposure_var.set(current_exposure)
         self.gain_var.set(current_gain)
         # V4L2: 3=auto, 1=manual; OpenCV: 0.75=auto, 0.25=manual
-        self.auto_exposure_var.set(current_auto_exp == 3.0 or current_auto_exp == 0.75)
+        self.auto_exposure_var.set(auto_enabled)
         
-        # Update labels
-        self.exposure_label.config(text=f"{current_exposure:.1f}")
-        self.gain_label.config(text=f"{current_gain:.1f}")
+        # Update entry fields
+        self.exposure_entry.delete(0, tk.END)
+        self.exposure_entry.insert(0, f"{current_exposure:.1f}")
+        self.gain_entry.delete(0, tk.END)
+        self.gain_entry.insert(0, f"{current_gain:.1f}")
         
         # Set exposure scale state based on auto exposure
         auto_enabled = (current_auto_exp == 3.0 or current_auto_exp == 0.75)
@@ -533,6 +588,8 @@ class WebcamApp:
                 self.status_var.set(f"Switched to Camera {camera_index}")
                 self.config["camera_index"] = camera_index
                 save_config(self.config)
+                # Update slider ranges for the new camera
+                self.initialize_camera_controls()
                 self.update_info_panel()
             else:
                 self.status_var.set(f"Failed to initialize Camera {camera_index}")
@@ -561,13 +618,45 @@ class WebcamApp:
     
     def preview_loop(self):
         """Main loop for camera preview with black frame detection."""
+        # Flush initial frames on Windows DirectShow to avoid black frames
+        if sys.platform.startswith('win') and self.camera_controller and self.camera_controller.cap:
+            print("Flushing initial frames for warm-up...")
+            for _ in range(5):
+                try:
+                    self.camera_controller.cap.read()
+                except:
+                    pass
+                time.sleep(0.02)
+            print("Starting preview loop...")
+        
         black_frame_count = 0
         max_black_frames = 30  # Allow some black frames before taking action
+        failed_frame_count = 0
+        max_failed_frames = 100  # Only reinit after many failures
+        frame_count = 0
         
         while self.preview_running:
             try:
+                # Pause this loop when recording is active (recording_loop handles preview)
+                if self.pause_preview_for_recording:
+                    if frame_count < 2:  # Only print once
+                        print("Preview loop PAUSED - recording loop has camera ownership")
+                    time.sleep(0.1)  # Just wait while recording handles everything
+                    continue
+                
                 frame = self.camera_controller.get_frame()
+                frame_count += 1
+                
+                # Debug output
                 if frame is not None:
+                    if frame_count <= 5:
+                        print(f"Frame {frame_count}: Got frame {frame.shape}, mean={frame.mean():.2f}")
+                else:
+                    if frame_count <= 10:
+                        print(f"Frame {frame_count}: None - check camera connection")
+                
+                if frame is not None:
+                    failed_frame_count = 0  # Reset failed count on success
                     # Check if frame is mostly black
                     frame_mean = frame.mean()
                     if frame_mean <= 1.0:  # Very dark/black frame
@@ -586,9 +675,13 @@ class WebcamApp:
                     # Schedule GUI update in main thread
                     self.root.after(0, self.update_preview, frame)
                 else:
-                    # If no frame, try to reinitialize camera
-                    if not self.camera_controller.initialize_camera():
-                        print("Warning: Camera reinitialization failed")
+                    # If no frame, count failures before attempting reinit
+                    failed_frame_count += 1
+                    if failed_frame_count >= max_failed_frames:
+                        print(f"Camera failed {max_failed_frames} times, attempting reinit...")
+                        if not self.camera_controller.initialize_camera():
+                            print("Warning: Camera reinitialization failed")
+                        failed_frame_count = 0  # Reset counter
                 time.sleep(0.033)  # ~30 FPS
             except Exception as e:
                 print(f"Preview loop error: {e}")
@@ -619,6 +712,14 @@ class WebcamApp:
             canvas_height = 480  # Default canvas height
         
         try:
+            # Validate frame before processing
+            if frame.size == 0 or len(frame.shape) < 2:
+                return
+            
+            # Ensure frame is contiguous in memory (fixes Windows matrix errors)
+            if not frame.flags['C_CONTIGUOUS']:
+                frame = np.ascontiguousarray(frame)
+            
             # Calculate scaling to maintain aspect ratio
             h, w = frame.shape[:2]
             scale = min(canvas_width / w, canvas_height / h)
@@ -630,6 +731,10 @@ class WebcamApp:
             
             # Convert BGR to RGB
             rgb_frame = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
+            
+            # Ensure RGB frame is also contiguous
+            if not rgb_frame.flags['C_CONTIGUOUS']:
+                rgb_frame = np.ascontiguousarray(rgb_frame)
             
             # Convert to PIL Image and then to PhotoImage
             pil_image = Image.fromarray(rgb_frame)
@@ -675,8 +780,12 @@ class WebcamApp:
         
         filename = get_timestamp_filename("photo", "jpg")
         
-        if self.camera_controller.take_photo(filename, photo_dir):
+        success, frame = self.camera_controller.take_photo(filename, photo_dir)
+        if success:
             self.status_var.set(f"Photo saved: {filename}")
+            # Display the captured photo in preview
+            if frame is not None and self.image_tk_available:
+                self.update_preview(frame)
             show_info_message("Success", f"Photo saved as {filename}")
         else:
             self.status_var.set("Failed to take photo")
@@ -693,12 +802,16 @@ class WebcamApp:
             video_dir = self.config.get("video_directory", "videos")
             ensure_directory_exists(video_dir)
             
-            filename = get_timestamp_filename("video", "mp4")
+            filename = get_timestamp_filename("video", "mp4")  # Use .mp4 for best compatibility
             
             if self.camera_controller.start_recording(filename, video_dir):
                 self.record_btn.config(text="Stop Recording")
                 self.recording_label.config(text="● REC")
                 self.status_var.set("Recording started")
+                
+                # Pause preview loop to avoid competing for camera frames
+                # Recording loop will handle both recording AND preview updates
+                self.pause_preview_for_recording = True
                 
                 # Start recording thread
                 self.recording_thread = threading.Thread(target=self.recording_loop, 
@@ -712,15 +825,48 @@ class WebcamApp:
                 self.record_btn.config(text="Start Recording")
                 self.recording_label.config(text="")
                 self.status_var.set("Recording stopped")
+                
+                # Resume preview loop
+                self.pause_preview_for_recording = False
+                
                 show_info_message("Success", "Recording saved successfully")
             else:
                 show_error_message("Error", "Failed to stop recording")
     
     def recording_loop(self):
         """Loop for continuous video recording."""
+        frames_recorded = 0
+        last_preview_time = time.time()
+        preview_interval = 0.05  # Update preview every 50ms for smooth playback
+        
+        print("Recording loop started - this is now the sole frame source")
+        
         while self.camera_controller and self.camera_controller.is_recording:
-            self.camera_controller.record_frame()
-            time.sleep(0.033)  # ~30 FPS
+            # record_frame() is the SOLE source of frames from camera during recording
+            # This prevents preview_loop from competing for camera access
+            success, frame = self.camera_controller.record_frame()
+            if success:
+                frames_recorded += 1
+                self.current_frame = frame  # Update current frame for other uses
+                
+                # Update preview periodically to reduce GUI overhead
+                # But less frequently than frame capture for maximum recording speed
+                current_time = time.time()
+                if current_time - last_preview_time >= preview_interval and self.image_tk_available:
+                    if frame is not None:
+                        # Schedule GUI update in main thread
+                        self.root.after(0, self.update_preview, frame)
+                    last_preview_time = current_time
+            else:
+                # Failed to record frame
+                if self.camera_controller.is_recording:
+                    print(f"Warning: Failed to record frame {frames_recorded + 1}")
+                    # Small delay on failure to avoid tight loop
+                    time.sleep(0.001)
+            
+            # No sleep on success - run as fast as camera can provide frames
+        
+        print(f"Recording loop ended: {frames_recorded} frames recorded by loop")
     
     def start_timelapse(self):
         """Start timelapse capture."""
@@ -861,6 +1007,20 @@ class WebcamApp:
                 self.status_var.set("Auto exposure enabled")
             else:
                 self.status_var.set("Manual exposure enabled")
+            
+            # On Windows, camera stream may need recovery after mode change
+            if sys.platform.startswith('win'):
+                # Give camera time to adjust and flush frames
+                time.sleep(0.1)
+                # Test if camera is still responding
+                test_frame = self.camera_controller.get_frame()
+                if test_frame is None:
+                    print("Warning: Camera stream disrupted after auto exposure change, attempting recovery...")
+                    # Try to recover by reinitializing
+                    if self.camera_controller.reinitialize_camera():
+                        self.status_var.set("Auto exposure changed (camera recovered)")
+                    else:
+                        self.status_var.set("Camera stream disrupted - use Fix Camera button")
         else:
             self.status_var.set("Failed to change auto exposure setting")
         
@@ -874,8 +1034,9 @@ class WebcamApp:
         exposure_value = float(value)
         success = self.camera_controller.set_exposure_time(exposure_value)
         
-        # Update label
-        self.exposure_label.config(text=f"{exposure_value:.1f}")
+        # Update entry field
+        self.exposure_entry.delete(0, tk.END)
+        self.exposure_entry.insert(0, f"{exposure_value:.1f}")
         
         if success:
             self.status_var.set(f"Exposure set to {exposure_value:.1f}")
@@ -888,15 +1049,109 @@ class WebcamApp:
             return
         
         gain_value = float(value)
+        
+        # Special handling for gain = 0
+        if gain_value == 0.0:
+            success = self.camera_controller.set_gain(gain_value)
+            # Update entry field
+            self.gain_entry.delete(0, tk.END)
+            self.gain_entry.insert(0, f"{gain_value:.1f}")
+            
+            if success:
+                self.status_var.set("Gain set to 0.0 (minimum gain)")
+            else:
+                self.status_var.set("Gain set to 0.0")
+            return
+        
         success = self.camera_controller.set_gain(gain_value)
         
-        # Update label
-        self.gain_label.config(text=f"{gain_value:.1f}")
+        # Update entry field
+        self.gain_entry.delete(0, tk.END)
+        self.gain_entry.insert(0, f"{gain_value:.1f}")
         
         if success:
-            self.status_var.set(f"Gain set to {gain_value:.1f}")
+            # Verify the actual value set
+            actual_gain = self.camera_controller.cap.get(cv2.CAP_PROP_GAIN) if self.camera_controller.cap else gain_value
+            if abs(actual_gain - gain_value) > 1.0:
+                self.status_var.set(f"Gain set to {actual_gain:.1f} (camera adjusted from {gain_value:.1f})")
+            else:
+                self.status_var.set(f"Gain set to {gain_value:.1f}")
         else:
-            self.status_var.set("Failed to set gain")
+            self.status_var.set("Failed to set gain (camera may not support gain control)")
+    
+    def on_exposure_entry(self, event=None):
+        """Handle exposure entry field change."""
+        if not self.camera_controller or self.auto_exposure_var.get():
+            return
+        
+        try:
+            exposure_value = float(self.exposure_entry.get())
+            
+            # Get slider range and clamp value
+            min_exp = self.exposure_scale.cget('from')
+            max_exp = self.exposure_scale.cget('to')
+            exposure_value = max(min_exp, min(max_exp, exposure_value))
+            
+            # Set the value and apply it
+            self.exposure_var.set(exposure_value)
+            # Manually trigger the change to ensure status updates
+            self.camera_controller.set_exposure_time(exposure_value)
+            
+            # Update entry field with clamped value
+            self.exposure_entry.delete(0, tk.END)
+            self.exposure_entry.insert(0, f"{exposure_value:.1f}")
+            
+            # Update status
+            self.status_var.set(f"Exposure set to {exposure_value:.1f}")
+        except ValueError:
+            # Invalid input, restore current value
+            current_value = self.exposure_var.get()
+            self.exposure_entry.delete(0, tk.END)
+            self.exposure_entry.insert(0, f"{current_value:.1f}")
+            self.status_var.set("Invalid exposure value")
+    
+    def on_gain_entry(self, event=None):
+        """Handle gain entry field change."""
+        if not self.camera_controller:
+            return
+        
+        try:
+            gain_value = float(self.gain_entry.get())
+            
+            # Get slider range and clamp value
+            min_gain = self.gain_scale.cget('from')
+            max_gain = self.gain_scale.cget('to')
+            gain_value = max(min_gain, min(max_gain, gain_value))
+            
+            # Set the value and apply it
+            self.gain_var.set(gain_value)
+            # Manually trigger the change to ensure status updates
+            success = self.camera_controller.set_gain(gain_value)
+            
+            # Update entry field with clamped value
+            self.gain_entry.delete(0, tk.END)
+            self.gain_entry.insert(0, f"{gain_value:.1f}")
+            
+            # Update status (same logic as on_gain_changed)
+            if gain_value == 0.0:
+                if success:
+                    self.status_var.set("Gain set to 0.0 (minimum gain)")
+                else:
+                    self.status_var.set("Gain set to 0.0")
+            elif success:
+                actual_gain = self.camera_controller.cap.get(cv2.CAP_PROP_GAIN) if self.camera_controller.cap else gain_value
+                if abs(actual_gain - gain_value) > 1.0:
+                    self.status_var.set(f"Gain set to {actual_gain:.1f} (camera adjusted from {gain_value:.1f})")
+                else:
+                    self.status_var.set(f"Gain set to {gain_value:.1f}")
+            else:
+                self.status_var.set("Failed to set gain (camera may not support gain control)")
+        except ValueError:
+            # Invalid input, restore current value
+            current_value = self.gain_var.get()
+            self.gain_entry.delete(0, tk.END)
+            self.gain_entry.insert(0, f"{current_value:.1f}")
+            self.status_var.set("Invalid gain value")
 
     def update_info_panel(self):
         """Update the information panel."""
@@ -913,8 +1168,21 @@ class WebcamApp:
                 info_lines.append(f"FPS: {properties.get('fps', 'N/A')}\n")
                 info_lines.append(f"Brightness: {properties.get('brightness', 'N/A'):.2f}\n")
                 info_lines.append(f"Contrast: {properties.get('contrast', 'N/A'):.2f}\n")
-                info_lines.append(f"Exposure: {properties.get('exposure', 'N/A'):.2f}\n")
-                info_lines.append(f"Gain: {properties.get('gain', 'N/A'):.2f}\n")
+                info_lines.append(f"Saturation: {properties.get('saturation', 'N/A'):.2f}\n")
+                info_lines.append(f"\nExposure: {properties.get('exposure', 'N/A'):.2f}\n")
+                
+                # Show exposure range if available
+                if hasattr(self, 'current_exposure_range') and self.current_exposure_range != (0.0, 0.0):
+                    exp_min, exp_max = self.current_exposure_range
+                    info_lines.append(f"Exposure Range: {exp_min:.1f} to {exp_max:.1f}\n")
+                
+                info_lines.append(f"\nGain: {properties.get('gain', 'N/A'):.2f}\n")
+                
+                # Show gain range if available
+                if hasattr(self, 'current_gain_range') and self.current_gain_range != (0.0, 0.0):
+                    gain_min, gain_max = self.current_gain_range
+                    info_lines.append(f"Gain Range: {gain_min:.1f} to {gain_max:.1f}\n")
+                
                 auto_exp = properties.get('auto_exposure', 'N/A')
                 # V4L2: 3=auto, 1=manual; OpenCV: 0.75=auto, 0.25=manual
                 if auto_exp == 3.0 or auto_exp == 0.75:
@@ -923,7 +1191,7 @@ class WebcamApp:
                     auto_exp_text = "Manual"
                 else:
                     auto_exp_text = f"{auto_exp:.2f}"
-                info_lines.append(f"Auto Exposure: {auto_exp_text}\n")
+                info_lines.append(f"\nAuto Exposure: {auto_exp_text}\n")
             else:
                 info_lines.append("Camera not available\n")
         else:
@@ -995,8 +1263,14 @@ def main():
     except:
         pass
     
-    app = WebcamApp(root)
-    root.mainloop()
+    try:
+        app = WebcamApp(root)
+        root.mainloop()
+    except Exception as e:
+        print(f"Application error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 
 if __name__ == "__main__":
