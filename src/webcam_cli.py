@@ -154,9 +154,11 @@ class WebcamCLI:
             print(f"Gain: {properties.get('gain', 'N/A'):.2f}")
             
             auto_exp = properties.get('auto_exposure', 'N/A')
-            if auto_exp == 0.75:
+            # Auto modes: 3 (V4L2), 0.75 (DirectShow), -1 (some cameras)
+            # Manual modes: 1 (V4L2), 0.25 (DirectShow)
+            if auto_exp in [3.0, 0.75, -1.0]:
                 auto_exp_text = "Auto"
-            elif auto_exp == 0.25:
+            elif auto_exp in [1.0, 0.25]:
                 auto_exp_text = "Manual"
             else:
                 auto_exp_text = f"{auto_exp:.2f}"

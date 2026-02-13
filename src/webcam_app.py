@@ -59,6 +59,7 @@ class WebcamApp:
         self.recording_thread = None
         self.timelapse_thread = None
         self.timelapse_running = False
+        self.auto_exposure_unstable = False
         self.config = self.load_application_config()
         self.image_tk_available = False
         self.image_tk_error = None
@@ -222,10 +223,10 @@ class WebcamApp:
         
         # Auto Exposure Toggle
         self.auto_exposure_var = tk.BooleanVar(value=True)
-        auto_exposure_cb = ttk.Checkbutton(control_frame, text="Auto Exposure", 
-                                          variable=self.auto_exposure_var,
-                                          command=self.on_auto_exposure_changed)
-        auto_exposure_cb.grid(row=14, column=0, columnspan=3, sticky=tk.W, pady=2)
+        self.auto_exposure_cb = ttk.Checkbutton(control_frame, text="Auto Exposure", 
+                               variable=self.auto_exposure_var,
+                               command=self.on_auto_exposure_changed)
+        self.auto_exposure_cb.grid(row=14, column=0, columnspan=3, sticky=tk.W, pady=2)
         
         # Exposure Control
         ttk.Label(control_frame, text="Exposure:").grid(row=15, column=0, sticky=tk.W)
@@ -457,8 +458,13 @@ class WebcamApp:
         current_gain = properties.get('gain', 0.0)
         current_auto_exp = properties.get('auto_exposure', 0.75)
         
-        # Check if we're in auto exposure mode
-        auto_enabled = (current_auto_exp == 3.0 or current_auto_exp == 0.75)
+        # Use controller state first; raw mode values can be ambiguous on some drivers.
+        auto_enabled = self.camera_controller.is_auto_exposure_enabled(default=True)
+
+        # If auto mode has proven unstable this session, force manual.
+        if self.auto_exposure_unstable:
+            auto_enabled = False
+            self.camera_controller.set_auto_exposure(False)
         
         # If not in auto mode, clamp and set values to ensure camera is in correct state
         if not auto_enabled:
@@ -475,8 +481,10 @@ class WebcamApp:
         # Update UI controls without triggering callbacks
         self.exposure_var.set(current_exposure)
         self.gain_var.set(current_gain)
-        # V4L2: 3=auto, 1=manual; OpenCV: 0.75=auto, 0.25=manual
         self.auto_exposure_var.set(auto_enabled)
+
+        if hasattr(self, 'auto_exposure_cb'):
+            self.auto_exposure_cb.config(state='disabled' if self.auto_exposure_unstable else 'normal')
         
         # Update entry fields
         self.exposure_entry.delete(0, tk.END)
@@ -485,7 +493,7 @@ class WebcamApp:
         self.gain_entry.insert(0, f"{current_gain:.1f}")
         
         # Set exposure scale state based on auto exposure
-        auto_enabled = (current_auto_exp == 3.0 or current_auto_exp == 0.75)
+        auto_enabled = self.camera_controller.is_auto_exposure_enabled(default=auto_enabled)
         state = 'disabled' if auto_enabled else 'normal'
         self.exposure_scale.config(state=state)
     
@@ -493,6 +501,7 @@ class WebcamApp:
         """Refresh the list of available cameras."""
         if self.camera_controller:
             available_cameras = self.camera_controller.list_available_cameras(verbose=False)
+            self._cached_camera_list = available_cameras
             
             if available_cameras:
                 # Create detailed camera options with resolution info
@@ -527,6 +536,58 @@ class WebcamApp:
                 self.camera_var.set("No cameras found")
             
             self.update_info_panel()
+
+    def _force_manual_mode(self, allow_reinitialize: bool = False) -> bool:
+        """Try hard to force manual exposure mode for unstable camera drivers."""
+        if not self.camera_controller:
+            return False
+
+        for _ in range(3):
+            if self.camera_controller.set_auto_exposure(False):
+                if self.camera_controller.is_manual_exposure_effective():
+                    return True
+            time.sleep(0.1)
+
+        if allow_reinitialize and self.camera_controller.reinitialize_camera():
+            for _ in range(3):
+                if self.camera_controller.set_auto_exposure(False):
+                    if self.camera_controller.is_manual_exposure_effective():
+                        return True
+                time.sleep(0.1)
+
+        return False
+
+    def _ensure_manual_controls_ready(self) -> bool:
+        """Ensure manual control is active before writing exposure/gain values.
+
+        This deliberately avoids re-probing the camera on every slider
+        interaction.  Aggressive probing (writing multiple exposure values
+        and checking readback) can destabilise DirectShow drivers and, on
+        failure, used to revert the camera back to auto mode — undoing the
+        user's explicit toggle and breaking subsequent gain/exposure writes.
+
+        Instead we trust the bookkeeping flag that was already validated
+        when the user toggled auto exposure off.
+        """
+        if not self.camera_controller:
+            return False
+
+        if self.auto_exposure_var.get():
+            return False
+
+        # The user already toggled auto-exposure off via on_auto_exposure_changed
+        # which validated the switch.  Trust that state.
+        if self.camera_controller.auto_exposure_enabled is False:
+            return True
+
+        # State is unknown (None) — try once to set manual mode.
+        if self.camera_controller.set_auto_exposure(False):
+            return True
+
+        # Could not confirm manual mode, but do NOT revert the user's
+        # explicit choice to auto.  Let the write attempt proceed; the
+        # camera itself will accept or reject the value.
+        return True
     
     def fix_camera_issues(self):
         """Fix camera issues like black screens by reinitializing with different settings."""
@@ -548,9 +609,14 @@ class WebcamApp:
                 
                 # Try to reinitialize the camera
                 if self.camera_controller.reinitialize_camera():
+                    if self.auto_exposure_unstable:
+                        self._force_manual_mode(allow_reinitialize=False)
+                        self.auto_exposure_var.set(False)
+                        self.exposure_scale.config(state='normal')
                     self.status_var.set("Camera reinitialized successfully")
                     show_info_message("Camera Fixed", 
                                     "Camera has been reinitialized. The black screen issue should be resolved.")
+                    self.initialize_camera_controls()
                 else:
                     self.status_var.set("Camera reinitialization failed")
                     show_error_message("Camera Error", 
@@ -583,6 +649,11 @@ class WebcamApp:
             if self.camera_controller:
                 self.camera_controller.release()
             
+            # New camera selection should not inherit previous camera's auto-exposure lockout
+            self.auto_exposure_unstable = False
+            if hasattr(self, 'auto_exposure_cb'):
+                self.auto_exposure_cb.config(state='normal')
+
             self.camera_controller = CameraController(camera_index)
             if self.camera_controller.initialize_camera():
                 self.status_var.set(f"Switched to Camera {camera_index}")
@@ -837,7 +908,7 @@ class WebcamApp:
         """Loop for continuous video recording."""
         frames_recorded = 0
         last_preview_time = time.time()
-        preview_interval = 0.05  # Update preview every 50ms for smooth playback
+        preview_interval = 0.15  # Update preview ~7x/sec during recording (keep loop fast)
         
         print("Recording loop started - this is now the sole frame source")
         
@@ -849,18 +920,17 @@ class WebcamApp:
                 frames_recorded += 1
                 self.current_frame = frame  # Update current frame for other uses
                 
-                # Update preview periodically to reduce GUI overhead
-                # But less frequently than frame capture for maximum recording speed
+                # Update preview infrequently to keep recording hot path fast.
+                # GUI image conversion is expensive; only do it a few times
+                # per second rather than on every frame.
                 current_time = time.time()
                 if current_time - last_preview_time >= preview_interval and self.image_tk_available:
                     if frame is not None:
-                        # Schedule GUI update in main thread
                         self.root.after(0, self.update_preview, frame)
                     last_preview_time = current_time
             else:
                 # Failed to record frame
                 if self.camera_controller.is_recording:
-                    print(f"Warning: Failed to record frame {frames_recorded + 1}")
                     # Small delay on failure to avoid tight loop
                     time.sleep(0.001)
             
@@ -996,34 +1066,36 @@ class WebcamApp:
             return
         
         auto_enabled = self.auto_exposure_var.get()
+
+        if auto_enabled and self.auto_exposure_unstable:
+            self.auto_exposure_var.set(False)
+            self.exposure_scale.config(state='normal')
+            self.status_var.set("Auto exposure disabled for this session due to instability")
+            self.update_info_panel()
+            return
+        
+        # Store the current mode before attempting change
+        current_mode = self.camera_controller.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE) if self.camera_controller.cap else None
+        
         success = self.camera_controller.set_auto_exposure(auto_enabled)
         
-        # Enable/disable manual exposure control
+        # Enable/disable manual exposure control based on the user's choice.
+        # We honour the toggle regardless of whether the driver confirmed the
+        # mode switch, because many DirectShow drivers never acknowledge mode
+        # changes in their readback yet still allow manual exposure writes.
         state = 'disabled' if auto_enabled else 'normal'
         self.exposure_scale.config(state=state)
-        
-        if success:
-            if auto_enabled:
-                self.status_var.set("Auto exposure enabled")
-            else:
-                self.status_var.set("Manual exposure enabled")
-            
-            # On Windows, camera stream may need recovery after mode change
-            if sys.platform.startswith('win'):
-                # Give camera time to adjust and flush frames
-                time.sleep(0.1)
-                # Test if camera is still responding
-                test_frame = self.camera_controller.get_frame()
-                if test_frame is None:
-                    print("Warning: Camera stream disrupted after auto exposure change, attempting recovery...")
-                    # Try to recover by reinitializing
-                    if self.camera_controller.reinitialize_camera():
-                        self.status_var.set("Auto exposure changed (camera recovered)")
-                    else:
-                        self.status_var.set("Camera stream disrupted - use Fix Camera button")
+
+        if auto_enabled:
+            self.status_var.set("Auto exposure enabled")
         else:
-            self.status_var.set("Failed to change auto exposure setting")
-        
+            self.status_var.set("Manual exposure enabled")
+
+        if not success:
+            print(f"Note: Driver did not confirm auto-exposure mode change "
+                  f"(from {current_mode} to {'auto' if auto_enabled else 'manual'}), "
+                  f"but controls will be enabled anyway.")
+
         self.update_info_panel()
     
     def on_exposure_changed(self, value):
@@ -1094,15 +1166,17 @@ class WebcamApp:
             
             # Set the value and apply it
             self.exposure_var.set(exposure_value)
-            # Manually trigger the change to ensure status updates
-            self.camera_controller.set_exposure_time(exposure_value)
+            success = self.camera_controller.set_exposure_time(exposure_value)
             
             # Update entry field with clamped value
             self.exposure_entry.delete(0, tk.END)
             self.exposure_entry.insert(0, f"{exposure_value:.1f}")
             
             # Update status
-            self.status_var.set(f"Exposure set to {exposure_value:.1f}")
+            if success:
+                self.status_var.set(f"Exposure set to {exposure_value:.1f}")
+            else:
+                self.status_var.set("Failed to set exposure")
         except ValueError:
             # Invalid input, restore current value
             current_value = self.exposure_var.get()
@@ -1184,13 +1258,12 @@ class WebcamApp:
                     info_lines.append(f"Gain Range: {gain_min:.1f} to {gain_max:.1f}\n")
                 
                 auto_exp = properties.get('auto_exposure', 'N/A')
-                # V4L2: 3=auto, 1=manual; OpenCV: 0.75=auto, 0.25=manual
-                if auto_exp == 3.0 or auto_exp == 0.75:
+                if self.auto_exposure_unstable:
+                    auto_exp_text = "Manual (auto locked off)"
+                elif self.camera_controller and self.camera_controller.is_auto_exposure_enabled(default=True):
                     auto_exp_text = "Auto"
-                elif auto_exp == 1.0 or auto_exp == 0.25:
-                    auto_exp_text = "Manual"
                 else:
-                    auto_exp_text = f"{auto_exp:.2f}"
+                    auto_exp_text = "Manual"
                 info_lines.append(f"\nAuto Exposure: {auto_exp_text}\n")
             else:
                 info_lines.append("Camera not available\n")
@@ -1204,12 +1277,16 @@ class WebcamApp:
         
         info_lines.append("\n=== Available Cameras ===\n")
         if self.camera_controller:
-            cameras = self.camera_controller.list_available_cameras()
-            if cameras:
-                for cam in cameras:
+            # Use cached camera list instead of re-probing.  Calling
+            # list_available_cameras() opens new VideoCapture connections
+            # to every device, which on DirectShow resets driver state
+            # (including auto-exposure mode) and blocks the main thread
+            # for several seconds.
+            if hasattr(self, '_cached_camera_list') and self._cached_camera_list:
+                for cam in self._cached_camera_list:
                     info_lines.append(f"Camera {cam}\n")
             else:
-                info_lines.append("No cameras detected\n")
+                info_lines.append(f"Camera {self.camera_controller.camera_index}\n")
         
         self.info_text.insert(1.0, "".join(info_lines))
         self.info_text.config(state=tk.DISABLED)

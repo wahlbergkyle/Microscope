@@ -12,6 +12,7 @@ from datetime import datetime
 import os
 import sys
 import glob
+import threading
 from typing import Optional, Tuple, List
 import warnings
 import contextlib
@@ -66,6 +67,8 @@ class CameraController:
         self.is_recording = False
         self.video_writer = None
         self.recording_filename = None
+        self.auto_exposure_enabled = None
+        self._lock = threading.RLock()  # Reentrant: range probing calls set_auto_exposure
         
     def initialize_camera(self) -> bool:
         """
@@ -254,8 +257,49 @@ class CameraController:
             width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             fps = self.cap.get(cv2.CAP_PROP_FPS)
+            self.auto_exposure_enabled = self._infer_auto_exposure_state()
             
             print(f"Camera configured: {width}x{height} @ {fps:.1f}FPS")
+
+    def _switch_camera_backend(self, backend: int) -> bool:
+        """Reopen current camera with a different backend."""
+        old_backend = None
+        try:
+            if self.cap and self.cap.isOpened():
+                old_backend = int(self.cap.get(cv2.CAP_PROP_BACKEND))
+        except Exception:
+            old_backend = None
+
+        if self.cap:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+
+        try:
+            print(f"Trying to reopen camera {self.camera_index} with backend {self._get_backend_name(backend)}...")
+            new_cap = cv2.VideoCapture(self.camera_index, backend)
+            if not new_cap.isOpened():
+                return False
+
+            frame_ok = False
+            for _ in range(12):
+                ret, frame = new_cap.read()
+                if ret and frame is not None and frame.size > 0:
+                    frame_ok = True
+                    break
+                time.sleep(0.05)
+
+            if not frame_ok:
+                new_cap.release()
+                return False
+
+            self.cap = new_cap
+            self._configure_camera_properties()
+            return True
+        except Exception as error:
+            print(f"Failed to switch backend: {error}")
+            return False
     
     def get_frame(self) -> Optional[np.ndarray]:
         """
@@ -272,7 +316,8 @@ class CameraController:
         max_attempts = 10
         for attempt in range(max_attempts):
             try:
-                ret, frame = self.cap.read()
+                with self._lock:
+                    ret, frame = self.cap.read()
                 if not ret:
                     if attempt == 0:
                         print(f"get_frame: cap.read() returned False")
@@ -375,17 +420,15 @@ class CameraController:
         
         self.recording_filename = os.path.join(output_dir, base_name + ".mp4")
         
-        # Get camera properties
-        fps = int(self.cap.get(cv2.CAP_PROP_FPS))
-        if fps <= 0 or fps > 120:
-            fps = 30  # Default to 30 FPS if invalid
-            print(f"Invalid camera FPS detected, using {fps} FPS")
-        
-        # CRITICAL: Use lower FPS for VideoWriter to match actual capture rate
-        # Windows DirectShow often can't deliver frames as fast as reported
-        # Using a lower FPS prevents file corruption from frame timing mismatch
-        writer_fps = 10  # Conservative FPS that we can reliably achieve
-        print(f"Camera reports {fps} FPS, using {writer_fps} FPS for video file")
+        # Measure the camera's ACTUAL frame delivery rate.
+        # Many cameras (especially via DirectShow) report an incorrect FPS
+        # through CAP_PROP_FPS.  Using the reported value causes the video
+        # to play back at the wrong speed.  Instead, we time a short burst
+        # of real cap.read() calls to get the true rate.
+        reported_fps = int(self.cap.get(cv2.CAP_PROP_FPS))
+        measured_fps = self._measure_actual_fps()
+        writer_fps = measured_fps
+        print(f"Camera reports {reported_fps} FPS, measured {measured_fps} FPS, using {writer_fps} FPS for video file")
         
         width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -401,12 +444,11 @@ class CameraController:
         self.recording_height = height
         
         # Platform-specific codec selection
-        # On Windows, use FFmpeg backend codecs for better MP4 support
         if sys.platform.startswith('win'):
             codecs_to_try = [
-                ('MJPG', 'Motion JPEG'),       # Most reliable on Windows
-                ('mp4v', 'MPEG-4 (mp4v)'),     # Standard MP4
+                ('mp4v', 'MPEG-4 (mp4v)'),     # Proper MP4 codec
                 ('MP4V', 'MPEG-4 (MP4V)'),     # Uppercase variant
+                ('XVID', 'XVID'),               # Compatible fallback
             ]
         else:
             codecs_to_try = [
@@ -414,7 +456,6 @@ class CameraController:
                 ('avc1', 'H264'),
                 ('X264', 'X264'),
                 ('XVID', 'XVID'),
-                ('MJPG', 'Motion JPEG'),
             ]
         
         self.video_writer = None
@@ -441,30 +482,79 @@ class CameraController:
                 pass  # Try next codec
         
         if not self.video_writer or not self.video_writer.isOpened():
+            # Fallback: try MJPG in .avi container (MJPG doesn't work in .mp4)
+            try:
+                avi_filename = os.path.splitext(self.recording_filename)[0] + '.avi'
+                fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+                writer = cv2.VideoWriter(avi_filename, fourcc, writer_fps,
+                                        (width, height), True)
+                if writer.isOpened():
+                    self.video_writer = writer
+                    self.video_codec = 'MJPG'
+                    self.recording_filename = avi_filename
+                    print(f"Using Motion JPEG codec in .avi container")
+                else:
+                    writer.release()
+            except Exception:
+                pass
+
+        if not self.video_writer or not self.video_writer.isOpened():
             print("Error: Could not initialize video writer with any codec")
             return False
         
-        # Optimize camera for maximum recording speed
+        # Minimize buffer to reduce latency
         try:
-            # Request maximum FPS from camera (don't throttle)
-            self.cap.set(cv2.CAP_PROP_FPS, 60)  # Request high FPS, camera will provide what it can
-            
-            # Disable buffering to get frames as fast as camera provides them
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception as e:
-            print(f"Note: Could not optimize all camera settings: {e}")
+            print(f"Note: Could not set buffer size: {e}")
         
         self.is_recording = True
         self.frame_count = 0  # Track frames written
         self.recording_start_time = time.time()  # Track when recording started
         print(f"Recording started: {self.recording_filename}")
         
-        # Print actual camera FPS setting
-        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
-        print(f"Camera FPS setting: {actual_fps}")
-        
         return True
     
+    def _measure_actual_fps(self, sample_frames: int = 15) -> int:
+        """
+        Measure the camera's actual frame delivery rate by timing real reads.
+        
+        Args:
+            sample_frames: Number of frames to time (more = more accurate but slower).
+        
+        Returns:
+            int: Measured FPS, clamped to a sensible range (5-120).
+        """
+        if not self.cap or not self.cap.isOpened():
+            return 10  # Safe default
+        
+        try:
+            # Warm up: discard a couple of frames to let the pipeline stabilize
+            with self._lock:
+                for _ in range(3):
+                    self.cap.read()
+            
+            # Time the burst
+            with self._lock:
+                start = time.time()
+                good = 0
+                for _ in range(sample_frames):
+                    ret, _ = self.cap.read()
+                    if ret:
+                        good += 1
+                elapsed = time.time() - start
+            
+            if good < 3 or elapsed <= 0:
+                return 10  # Not enough data
+            
+            fps = good / elapsed
+            # Clamp to a sensible range and round to nearest integer
+            fps = max(5, min(120, round(fps)))
+            return fps
+        except Exception as e:
+            print(f"FPS measurement failed: {e}")
+            return 10
+
     def record_frame(self) -> tuple[bool, Optional[np.ndarray]]:
         """
         Record the current frame to video (call this continuously while recording).
@@ -481,17 +571,14 @@ class CameraController:
         
         try:
             # Fast path: direct read without validation overhead
-            ret, frame = self.cap.read()
+            with self._lock:
+                ret, frame = self.cap.read()
             
             if ret and frame is not None and frame.size > 0:
                 # Resize frame if needed to match recording dimensions
                 if hasattr(self, 'recording_width') and hasattr(self, 'recording_height'):
                     if frame.shape[1] != self.recording_width or frame.shape[0] != self.recording_height:
                         frame = cv2.resize(frame, (self.recording_width, self.recording_height))
-                
-                # Only essential processing: ensure memory contiguity for Windows
-                if not frame.flags['C_CONTIGUOUS']:
-                    frame = np.ascontiguousarray(frame)
                 
                 # Write immediately - no black frame detection, no retries
                 if self.is_recording and self.video_writer:
@@ -567,9 +654,6 @@ class CameraController:
                     print("This usually means the codec failed to initialize properly.")
                 elif frame_count == 0:
                     print("Warning: No frames were written to the video file")
-                elif actual_fps < 20:
-                    print(f"Warning: Low capture rate ({actual_fps:.1f} FPS). Video may play faster than real-time.")
-                    print("Tip: Close other applications or reduce resolution for better performance.")
                 else:
                     print("✓ Video file appears valid")
             else:
@@ -601,6 +685,87 @@ class CameraController:
             'auto_exposure': self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE),
         }
         return properties
+
+    def _is_mode_close(self, value: float, target: float, tolerance: float = 0.05) -> bool:
+        """Return True if two mode values are effectively equal."""
+        try:
+            return abs(float(value) - float(target)) <= tolerance
+        except Exception:
+            return False
+
+    def _is_known_auto_mode(self, mode_value: float) -> bool:
+        """Return True for known auto-exposure mode values."""
+        return self._is_mode_close(mode_value, 3.0) or self._is_mode_close(mode_value, 0.75)
+
+    def _is_known_manual_mode(self, mode_value: float) -> bool:
+        """Return True for known manual-exposure mode values."""
+        return self._is_mode_close(mode_value, 1.0) or self._is_mode_close(mode_value, 0.25) or self._is_mode_close(mode_value, 0.0)
+
+    def _infer_auto_exposure_state(self) -> Optional[bool]:
+        """Infer auto exposure state from camera-reported mode values."""
+        if not self.cap or not self.cap.isOpened():
+            return None
+
+        mode_value = self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+        if self._is_known_auto_mode(mode_value):
+            return True
+        if self._is_known_manual_mode(mode_value):
+            return False
+        return None
+
+    def is_auto_exposure_enabled(self, default: bool = True) -> bool:
+        """Return current auto exposure state with fallback for ambiguous drivers."""
+        if self.auto_exposure_enabled is not None:
+            return self.auto_exposure_enabled
+
+        inferred = self._infer_auto_exposure_state()
+        if inferred is not None:
+            self.auto_exposure_enabled = inferred
+            return inferred
+
+        return default
+
+    def _probe_manual_exposure_control(self) -> bool:
+        """Check if manual exposure control is effective even with ambiguous auto-mode values."""
+        if not self.cap or not self.cap.isOpened():
+            return False
+
+        original_exposure = self.cap.get(cv2.CAP_PROP_EXPOSURE)
+        # Use a wider sweep because cameras may expose very different scales
+        # (e.g., -13..-1 on some drivers, 10..625 on others).
+        probe_values = [-13.0, -7.0, -1.0, 1.0, 10.0, 100.0]
+        observed_values = []
+
+        try:
+            for value in probe_values:
+                self.cap.set(cv2.CAP_PROP_EXPOSURE, value)
+                time.sleep(0.05)
+                observed = self.cap.get(cv2.CAP_PROP_EXPOSURE)
+                observed_float = float(observed)
+                observed_values.append(round(observed_float, 2))
+
+            unique_values = set(observed_values)
+            if len(unique_values) < 2:
+                return False
+
+            min_obs = min(observed_values)
+            max_obs = max(observed_values)
+            span = abs(max_obs - min_obs)
+
+            # Manual control is considered effective if readback changes across
+            # probe values and covers a meaningful span.
+            return len(unique_values) >= 3 and span >= 1.0
+        except Exception:
+            return False
+        finally:
+            try:
+                self.cap.set(cv2.CAP_PROP_EXPOSURE, original_exposure)
+            except Exception:
+                pass
+
+    def is_manual_exposure_effective(self) -> bool:
+        """Public helper to check whether manual exposure control is currently effective."""
+        return self._probe_manual_exposure_control()
     
     def set_camera_property(self, property_id: int, value: float) -> bool:
         """
@@ -631,17 +796,25 @@ class CameraController:
         if not self.cap or not self.cap.isOpened():
             return False
         
-        # V4L2 cameras use mode 1 for manual exposure (not 0.25)
-        # Try both common manual modes
-        auto_mode = self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
-        if auto_mode != 1.0 and auto_mode != 0.25:
-            # Try V4L2 manual mode first
-            if not self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1):
-                # Fall back to OpenCV mode
-                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+        # Block manual writes only when we *know* auto exposure is active.
+        # Trust self.auto_exposure_enabled over raw driver readback because many
+        # DirectShow drivers report stale/incorrect auto-mode values even after
+        # a successful switch to manual mode (the probe fallback in
+        # set_auto_exposure already accounts for this).
+        if self.auto_exposure_enabled is True:
+            auto_mode = self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+            print(f"Warning: Cannot set exposure while in auto exposure mode (mode={auto_mode})")
+            print("Hint: Disable auto exposure first before setting manual exposure")
+            return False
         
-        # Set the exposure value
-        return self.cap.set(cv2.CAP_PROP_EXPOSURE, exposure_value)
+        # Write the exposure value under the lock so the preview thread's
+        # cap.read() cannot race with cap.set().
+        with self._lock:
+            success = self.cap.set(cv2.CAP_PROP_EXPOSURE, exposure_value)
+
+        if success:
+            self.auto_exposure_enabled = False
+        return success
     
     def set_gain(self, gain_value: float) -> bool:
         """
@@ -656,25 +829,14 @@ class CameraController:
         if not self.cap or not self.cap.isOpened():
             return False
         
-        # On Windows (DirectShow/MSMF) and some cameras, gain control requires manual exposure mode
-        # V4L2 cameras use mode 1 for manual exposure, DirectShow uses 0.25
-        auto_mode = self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
-        if auto_mode != 1.0 and auto_mode != 0.25:
-            # Try V4L2 manual mode first
-            if not self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1):
-                # Fall back to OpenCV/DirectShow manual mode
-                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+        # Gain control typically works in both auto and manual modes,
+        # but some cameras may ignore it in auto mode
+        # We'll allow setting it and let the camera decide
         
-        # Now try to set the gain value
-        success = self.cap.set(cv2.CAP_PROP_GAIN, gain_value)
-        
-        # Verify the gain was actually set (some cameras silently fail)
-        if success:
-            actual_gain = self.cap.get(cv2.CAP_PROP_GAIN)
-            # Check if the value is reasonably close (within 10%)
-            if abs(actual_gain - gain_value) > gain_value * 0.1 and abs(actual_gain - gain_value) > 1.0:
-                print(f"Warning: Requested gain {gain_value}, but camera reports {actual_gain}")
-                # Still return True since the set operation succeeded
+        # Set gain under the lock so the preview thread's cap.read()
+        # cannot race with cap.set().
+        with self._lock:
+            success = self.cap.set(cv2.CAP_PROP_GAIN, gain_value)
         
         return success
     
@@ -691,29 +853,50 @@ class CameraController:
         if not self.cap or not self.cap.isOpened():
             return False
         
-        # V4L2 cameras: 3 = auto, 1 = manual
-        # OpenCV default: 0.75 = auto, 0.25 = manual
-        # Try V4L2 mode first, fall back to OpenCV mode
-        success = False
-        if auto:
-            success = self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)
+        # All cap interactions under the lock to prevent race with preview thread.
+        with self._lock:
+            current_mode = self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+            
+            # Different cameras use different values for auto/manual modes:
+            # Auto modes: 3 (V4L2), 0.75 (DirectShow/OpenCV), -1 (some cameras)
+            # Manual modes: 1 (V4L2), 0.25 (DirectShow/OpenCV)
+            auto_modes = [3, 0.75, -1]
+            manual_modes = [1, 0.25, 0]
+            
+            # Check if already in the desired mode
+            success = False
+            if auto:
+                if self._is_known_auto_mode(current_mode):
+                    success = True
+            else:
+                if self._is_known_manual_mode(current_mode):
+                    success = True
+
+            modes_to_try = auto_modes if auto else manual_modes
+
             if not success:
-                success = self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
-        else:
-            success = self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+                for mode_value in modes_to_try:
+                    if self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, mode_value):
+                        new_mode = self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+                        if auto and (self._is_known_auto_mode(new_mode) or self._is_mode_close(new_mode, mode_value)):
+                            success = True
+                            break
+                        elif not auto and (self._is_known_manual_mode(new_mode) or self._is_mode_close(new_mode, mode_value)):
+                            success = True
+                            break
+
             if not success:
-                success = self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-        
-        # On Windows, changing exposure mode can disrupt the stream
-        # Flush a few frames to allow camera to stabilize
-        if success and sys.platform.startswith('win'):
-            import time
-            time.sleep(0.05)  # Brief delay for camera to adjust
-            for _ in range(3):
-                try:
-                    self.cap.read()
-                except:
-                    pass
+                # Many DirectShow drivers return ambiguous readback values (e.g. -1)
+                # regardless of the actual mode.  Accept optimistically if cap.set
+                # returned True for at least one attempt.
+                for mode_value in modes_to_try:
+                    if self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, mode_value):
+                        success = True
+                        break
+
+        # Always update the bookkeeping flag — even if the driver gave
+        # ambiguous readback, the user’s intent is clear.
+        self.auto_exposure_enabled = auto
         
         return success
     
@@ -728,36 +911,38 @@ class CameraController:
             return (0.0, 0.0)
         
         try:
-            # Save current state
-            original_mode = self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
-            current = self.cap.get(cv2.CAP_PROP_EXPOSURE)
-            
-            # Set manual mode for accurate exposure control
-            # Try V4L2 manual mode first
-            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
-            if self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE) != 1:
-                # Fall back to DirectShow manual mode
-                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-            
-            # Collect actual values the camera reports
-            test_values = [-13, -10, -7, -5, -3, 1, 10, 50, 100, 500, 1000, 5000, 10000]
-            actual_values = []
-            
-            for test_val in test_values:
-                self.cap.set(cv2.CAP_PROP_EXPOSURE, test_val)
-                actual = self.cap.get(cv2.CAP_PROP_EXPOSURE)
-                if actual not in actual_values:
-                    actual_values.append(actual)
-            
-            if actual_values:
-                min_exp = min(actual_values)
-                max_exp = max(actual_values)
-            else:
-                min_exp, max_exp = 10.0, 625.0  # Fallback
-            
-            # Restore original exposure and mode
-            self.cap.set(cv2.CAP_PROP_EXPOSURE, current)
-            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, original_mode)
+            with self._lock:
+                # Save current state
+                original_mode = self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+                current = self.cap.get(cv2.CAP_PROP_EXPOSURE)
+                original_auto_state = self.auto_exposure_enabled
+                
+                # Set manual mode for accurate exposure control
+                self.set_auto_exposure(False)
+                
+                # Collect actual values the camera reports
+                test_values = [-13, -10, -7, -5, -3, 1, 10, 50, 100, 500, 1000, 5000, 10000]
+                actual_values = []
+                
+                for test_val in test_values:
+                    self.cap.set(cv2.CAP_PROP_EXPOSURE, test_val)
+                    actual = self.cap.get(cv2.CAP_PROP_EXPOSURE)
+                    if actual not in actual_values:
+                        actual_values.append(actual)
+                
+                if actual_values:
+                    min_exp = min(actual_values)
+                    max_exp = max(actual_values)
+                else:
+                    min_exp, max_exp = 10.0, 625.0  # Fallback
+                
+                # Restore original exposure and mode
+                self.cap.set(cv2.CAP_PROP_EXPOSURE, current)
+                if original_auto_state is None:
+                    self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, original_mode)
+                    self.auto_exposure_enabled = self._infer_auto_exposure_state()
+                else:
+                    self.set_auto_exposure(original_auto_state)
             
             # Ensure we have a valid range (min < max)
             if min_exp >= max_exp:
@@ -779,34 +964,37 @@ class CameraController:
             return (0.0, 0.0)
         
         try:
-            # Save current state
-            original_mode = self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
-            current_gain = self.cap.get(cv2.CAP_PROP_GAIN)
-            
-            # Set manual mode for accurate gain control
-            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # V4L2 manual
-            if self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE) != 1:
-                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # DirectShow manual
-            
-            # Collect actual values the camera reports
-            test_values = [0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 255.0]
-            actual_values = []
-            
-            for test_val in test_values:
-                self.cap.set(cv2.CAP_PROP_GAIN, test_val)
-                actual = self.cap.get(cv2.CAP_PROP_GAIN)
-                if actual not in actual_values:
-                    actual_values.append(actual)
-            
-            if actual_values:
-                min_gain = min(actual_values)
-                max_gain = max(actual_values)
-            else:
-                min_gain, max_gain = 0.0, 100.0  # Fallback
-            
-            # Restore original state
-            self.cap.set(cv2.CAP_PROP_GAIN, current_gain)
-            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, original_mode)
+            with self._lock:
+                # Save current state (use bookkeeping flag, not raw driver readback)
+                current_gain = self.cap.get(cv2.CAP_PROP_GAIN)
+                original_auto_state = self.auto_exposure_enabled
+                
+                # Set manual mode for accurate gain control
+                self.set_auto_exposure(False)
+                
+                # Collect actual values the camera reports
+                test_values = [0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 255.0]
+                actual_values = []
+                
+                for test_val in test_values:
+                    self.cap.set(cv2.CAP_PROP_GAIN, test_val)
+                    actual = self.cap.get(cv2.CAP_PROP_GAIN)
+                    if actual not in actual_values:
+                        actual_values.append(actual)
+                
+                if actual_values:
+                    min_gain = min(actual_values)
+                    max_gain = max(actual_values)
+                else:
+                    min_gain, max_gain = 0.0, 100.0  # Fallback
+                
+                # Restore original state
+                self.cap.set(cv2.CAP_PROP_GAIN, current_gain)
+                if original_auto_state is None:
+                    # State was unknown before probing; re-infer from driver
+                    self.auto_exposure_enabled = self._infer_auto_exposure_state()
+                else:
+                    self.set_auto_exposure(original_auto_state)
             
             # Ensure we have a valid range (min < max)
             if min_gain >= max_gain:
@@ -1067,6 +1255,7 @@ class CameraController:
         if self.cap:
             self.cap.release()
             self.cap = None
+            self.auto_exposure_enabled = None
         
         # Wait a moment for camera to be released
         time.sleep(0.5)
@@ -1085,6 +1274,7 @@ class CameraController:
         if self.cap:
             self.cap.release()
             self.cap = None
+            self.auto_exposure_enabled = None
         
         cv2.destroyAllWindows()
         print("Camera resources released")
