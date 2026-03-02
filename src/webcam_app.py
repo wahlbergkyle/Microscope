@@ -77,6 +77,7 @@ class WebcamApp:
         print("Initializing camera...")
         self.initialize_camera()
         print("Camera initialization complete")
+        self.update_info_panel()
         
         # Force canvas update after window is ready
         self.root.after(100, self.force_canvas_update)
@@ -269,12 +270,12 @@ class WebcamApp:
                  font=("Arial", 10, "bold")).grid(row=18, column=0, columnspan=3, 
                                                  sticky=tk.W, pady=(0, 5))
         
-        ttk.Button(control_frame, text="Photo Directory", 
+        ttk.Button(control_frame, text="Set Photo Directory", 
                   command=self.select_photo_directory).grid(row=19, column=0, 
                                                            columnspan=3, pady=2, 
                                                            sticky=(tk.W, tk.E))
         
-        ttk.Button(control_frame, text="Video Directory", 
+        ttk.Button(control_frame, text="Set Video Directory", 
                   command=self.select_video_directory).grid(row=20, column=0, 
                                                            columnspan=3, pady=2, 
                                                            sticky=(tk.W, tk.E))
