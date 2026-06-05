@@ -731,15 +731,15 @@ class CameraController:
             return False
 
         original_exposure = self.cap.get(cv2.CAP_PROP_EXPOSURE)
-        # Use a wider sweep because cameras may expose very different scales
-        # (e.g., -13..-1 on some drivers, 10..625 on others).
-        probe_values = [-13.0, -7.0, -1.0, 1.0, 10.0, 100.0]
+        # Wide sweep covers V4L2 log2 scale (-13..-1), mid-range, and high
+        # absolute values so cameras on any driver scale are detected.
+        probe_values = [-13.0, -7.0, -1.0, 1.0, 16.0, 256.0, 4096.0, 65536.0]
         observed_values = []
 
         try:
             for value in probe_values:
                 self.cap.set(cv2.CAP_PROP_EXPOSURE, value)
-                time.sleep(0.05)
+                time.sleep(0.05)  # Allow driver to latch the new value
                 observed = self.cap.get(cv2.CAP_PROP_EXPOSURE)
                 observed_float = float(observed)
                 observed_values.append(round(observed_float, 2))
@@ -903,53 +903,74 @@ class CameraController:
     def get_exposure_range(self) -> Tuple[float, float]:
         """
         Get the supported exposure range for this camera.
-        
+
+        Uses a wide logarithmic probe sweep covering both V4L2 log2 scale
+        (-13 to -1) and absolute linear scale (1 to 2^20 ≈ 1,000,000) with a
+        per-set settling delay and readback-clamping detection.  Because the
+        sweep goes far beyond any commonly assumed limit, the driver's true
+        hardware ceiling is reliably discovered even on cameras that support
+        much higher exposure values than the typical 10–625 range.
+
         Returns:
             Tuple[float, float]: (min_exposure, max_exposure) or (0, 0) if not supported
         """
         if not self.cap or not self.cap.isOpened():
             return (0.0, 0.0)
-        
+
         try:
             with self._lock:
                 # Save current state
                 original_mode = self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
                 current = self.cap.get(cv2.CAP_PROP_EXPOSURE)
                 original_auto_state = self.auto_exposure_enabled
-                
-                # Set manual mode for accurate exposure control
+
+                # Switch to manual mode so auto-exposure doesn't interfere
                 self.set_auto_exposure(False)
-                
-                # Collect actual values the camera reports
-                test_values = [-13, -10, -7, -5, -3, 1, 10, 50, 100, 500, 1000, 5000, 10000]
-                actual_values = []
-                
-                for test_val in test_values:
-                    self.cap.set(cv2.CAP_PROP_EXPOSURE, test_val)
-                    actual = self.cap.get(cv2.CAP_PROP_EXPOSURE)
-                    if actual not in actual_values:
-                        actual_values.append(actual)
-                
-                if actual_values:
-                    min_exp = min(actual_values)
-                    max_exp = max(actual_values)
-                else:
-                    min_exp, max_exp = 10.0, 625.0  # Fallback
-                
+                time.sleep(0.1)  # Allow mode-switch to settle
+
+                # Wide probe list:
+                #   neg_values  — V4L2 log2 scale: -13, -12, …, -1
+                #   pos_values  — exponential steps: 1, 2, 4, …, 1 048 576 (2^20)
+                # Exponential steps give good coverage over many orders of
+                # magnitude with only ~34 probes total.
+                neg_values = list(range(-13, 0))           # -13 … -1
+                pos_values = [2**i for i in range(0, 21)]  # 1 … 1 048 576
+                test_values = neg_values + pos_values
+
+                # Probe each candidate value.  A 50 ms delay after cap.set() is
+                # essential — many drivers need time to latch the value before
+                # cap.get() reflects it.
+                readbacks: dict = {}
+                for val in test_values:
+                    self.cap.set(cv2.CAP_PROP_EXPOSURE, float(val))
+                    time.sleep(0.05)
+                    rb = round(float(self.cap.get(cv2.CAP_PROP_EXPOSURE)), 4)
+                    readbacks[float(val)] = rb
+
+                # The true hardware min/max are the extremes of all readback
+                # values.  When the driver clamps (e.g. set(1_000_000) reads
+                # back 625) the plateau IS the hardware maximum — no extra
+                # detection logic needed because we probed well past the limit.
+                all_readbacks = list(readbacks.values())
+                min_exp = min(all_readbacks)
+                max_exp = max(all_readbacks)
+
                 # Restore original exposure and mode
                 self.cap.set(cv2.CAP_PROP_EXPOSURE, current)
+                time.sleep(0.05)
                 if original_auto_state is None:
                     self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, original_mode)
                     self.auto_exposure_enabled = self._infer_auto_exposure_state()
                 else:
                     self.set_auto_exposure(original_auto_state)
-            
+
             # Ensure we have a valid range (min < max)
             if min_exp >= max_exp:
                 return (10.0, 625.0)  # Fallback to default
-            
+
+            print(f"Exposure range discovered: {min_exp} to {max_exp}")
             return (min_exp, max_exp)
-        except:
+        except Exception:
             # Fallback to a reasonable default for most webcams
             return (10.0, 625.0)
     
