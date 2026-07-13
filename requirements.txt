@@ -1,8 +1,7 @@
-opencv-python>=4.8.0
-numpy>=1.24.0
-# Pillow requires system Tk/Tcl libraries for ImageTk support
-# Ubuntu/Debian: sudo apt-get install python3-tk tk-dev
-# Fedora/RHEL: sudo dnf install python3-tkinter tk-devel
-# Arch: sudo pacman -S tk
-# After installing system packages, reinstall: pip install --force-reinstall Pillow
-Pillow==10.4.0
+altgraph>=0.17.5
+numpy>=1.26.4
+opencv-python>=4.11.0
+packaging>=24.0
+pillow>=10.4.0
+pyinstaller>=6.0
+pyinstaller-hooks-contrib>=2024.0

@@ -147,10 +147,18 @@ class CameraController:
                             self.cap.release()
                             continue
                     
-                    # Test frame capture with multiple attempts
-                    # DirectShow on Windows may produce black frames initially - give it more time
-                    max_test_attempts = 30 if (sys.platform.startswith('win') and backend == cv2.CAP_DSHOW) else 5
-                    warmup_delay = 0.2 if (sys.platform.startswith('win') and backend == cv2.CAP_DSHOW) else 0.1
+                    # Test frame capture with multiple attempts.
+                    # Windows DirectShow and Linux/RPi both need generous warmup;
+                    # RPi USB bandwidth is limited so more attempts are needed.
+                    if sys.platform.startswith('win') and backend == cv2.CAP_DSHOW:
+                        max_test_attempts = 30
+                        warmup_delay = 0.2
+                    elif sys.platform.startswith('linux'):
+                        max_test_attempts = 15
+                        warmup_delay = 0.15
+                    else:
+                        max_test_attempts = 5
+                        warmup_delay = 0.1
                     
                     frame_captured = False
                     for attempt in range(max_test_attempts):
@@ -166,6 +174,14 @@ class CameraController:
                         print(f"Successfully initialized camera {camera_index} with {self._get_backend_name(backend)}")
                         self.camera_index = camera_index
                         self._configure_camera_properties()
+                        if sys.platform.startswith('linux'):
+                            # Flush frames after _configure_camera_properties bumps
+                            # resolution to 1280x720.  Without this, the camera
+                            # pipeline on RPi/ARM is still draining the old 640x480
+                            # buffers and the first preview reads come back black.
+                            for _ in range(15):
+                                self.cap.read()
+                            time.sleep(0.3)
                         return True
                     else:
                         print(f"Camera {camera_index} with {self._get_backend_name(backend)} opened but produces black frames")
@@ -210,35 +226,40 @@ class CameraController:
             return False
         
         try:
-            # Fix 1: Set buffer size to reduce latency and potential black frames
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            
-            # Fix 2: Force specific pixel format (MJPG is often more reliable)
-            # Try MJPG first as it's widely supported and efficient
-            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))
-            
-            # Fix 3: Set reasonable resolution (many USB cams have issues with high res)
+            # Fix 1: Buffer size 2 avoids USB stalls on RPi without losing frames
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+
+            # Fix 2: Set a safe initial resolution.
+            # MJPG is intentionally NOT forced here: many cameras (especially on
+            # RPi/ARM) only support MJPG at low resolutions and fall back to YUYV
+            # at 1280x720 (set later by _configure_camera_properties).  Forcing
+            # MJPG here and then changing resolution triggers a driver reset that
+            # leaves the camera producing black frames.
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            
-            # Fix 4: DON'T limit FPS - let camera run at native speed
+
+            # Fix 3: DON'T limit FPS - let camera run at native speed
             # Setting low FPS here can throttle recording performance
-            
-            # Fix 5: Disable auto-exposure initially (can cause black frames)
-            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # Manual mode
-            
-            # Fix 6: Set reasonable exposure value
+
+            # Fix 4: Disable auto-exposure using the platform-aware helper.
+            # V4L2 (Linux/RPi) uses mode=1 for manual; DirectShow uses 0.25.
+            # Calling cap.set(AUTO_EXPOSURE, 0.25) directly fails silently on
+            # V4L2, leaving auto-exposure on and corrupting the range probe.
+            self.set_auto_exposure(False)
+
+            # Fix 5: Set a reasonable default exposure value
             self.cap.set(cv2.CAP_PROP_EXPOSURE, -5)
-            
-            # Fix 7: Enable auto white balance
+
+            # Fix 6: Enable auto white balance
             self.cap.set(cv2.CAP_PROP_AUTO_WB, 1)
-            
-            # Fix 8: Flush initial frames that might be black
-            for _ in range(5):
+
+            # Fix 7: Flush initial frames - RPi/ARM needs more warmup than x86
+            is_arm = os.uname().machine.lower().startswith(('arm', 'aarch'))
+            warmup_frames = 15 if is_arm else 8
+            for _ in range(warmup_frames):
                 self.cap.read()
-                
-            time.sleep(0.2)  # Give camera time to adjust
-            
+            time.sleep(0.5 if is_arm else 0.2)
+
             return True
             
         except Exception as e:
@@ -994,7 +1015,9 @@ class CameraController:
                 self.set_auto_exposure(False)
                 
                 # Collect actual values the camera reports
-                test_values = [0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 255.0]
+                # Include high values: some V4L2 cameras (e.g. RPi-attached sensors)
+                # have gain ranges up to 1023 or 4095 in driver-native units.
+                test_values = [0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 255.0, 512.0, 1023.0, 4095.0]
                 actual_values = []
                 
                 for test_val in test_values:

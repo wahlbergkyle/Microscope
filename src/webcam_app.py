@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 import threading
 import sys
+print(f"APP IS RUNNING IN THIS PYTHON ENVIRONMENT: {sys.executable}")
 
 from PIL import Image
 try:
@@ -67,6 +68,8 @@ class WebcamApp:
         # Check ImageTk support for preview rendering
         self.image_tk_available, self.image_tk_error = self.check_imagetk_support()
         print(f"ImageTk available: {self.image_tk_available}")
+        if not self.image_tk_available:
+            print(f"{self.image_tk_error}")
 
         # Create GUI elements
         print("Setting up GUI...")
@@ -230,7 +233,8 @@ class WebcamApp:
         self.auto_exposure_cb.grid(row=14, column=0, columnspan=3, sticky=tk.W, pady=2)
         
         # Exposure Control
-        ttk.Label(control_frame, text="Exposure:").grid(row=15, column=0, sticky=tk.W)
+        self.exposure_label = ttk.Label(control_frame, text="Exposure:")
+        self.exposure_label.grid(row=15, column=0, sticky=tk.W)
         self.exposure_var = tk.DoubleVar(value=300.0)
         self.exposure_scale = ttk.Scale(control_frame, from_=10.0, to=625.0, 
                                        variable=self.exposure_var, orient=tk.HORIZONTAL,
@@ -445,7 +449,14 @@ class WebcamApp:
         if exposure_range != (0.0, 0.0):
             self.exposure_scale.config(from_=exposure_range[0], to=exposure_range[1])
             range_info.append(f"Exposure: {exposure_range[0]:.1f}-{exposure_range[1]:.1f}")
-        
+            # V4L2 (Linux/RPi) reports exposure in log₂-seconds (e.g. -13 to -1).
+            # Windows/macOS backends use absolute units.  Label accordingly.
+            if hasattr(self, 'exposure_label'):
+                if exposure_range[1] <= 0:
+                    self.exposure_label.config(text="Exposure (log\u2082s):")
+                else:
+                    self.exposure_label.config(text="Exposure:")
+
         if gain_range != (0.0, 0.0):
             self.gain_scale.config(from_=gain_range[0], to=gain_range[1])
             range_info.append(f"Gain: {gain_range[0]:.1f}-{gain_range[1]:.1f}")
